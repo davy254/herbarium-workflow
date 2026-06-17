@@ -1,0 +1,804 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Plant Specimen MGRS Validator</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://cdn.jsdelivr.net/npm/tesseract.js@4/dist/tesseract.min.js"></script>
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=Inter:wght@400;500;600&display=swap');
+
+        * { box-sizing: border-box; }
+
+        body {
+            font-family: 'Inter', sans-serif;
+            background: #f0f2f0;
+            color: #1a1f1a;
+            min-height: 100vh;
+            margin: 0;
+        }
+
+        /* Header */
+        .app-header {
+            background: #1a1f1a;
+            color: #e8ede8;
+            padding: 1.5rem 2rem;
+            display: flex;
+            align-items: baseline;
+            gap: 1rem;
+        }
+        .app-header h1 {
+            font-size: 1.125rem;
+            font-weight: 500;
+            margin: 0;
+            letter-spacing: -0.01em;
+        }
+        .app-header .subtitle {
+            font-size: 0.8125rem;
+            color: #6b7a6b;
+            font-family: 'IBM Plex Mono', monospace;
+        }
+
+        /* Status bar */
+        .status-bar {
+            background: #fff;
+            border-bottom: 1px solid #dde3dd;
+            padding: 0.625rem 2rem;
+            display: flex;
+            align-items: center;
+            gap: 1rem;
+        }
+        .status-dot {
+            width: 7px; height: 7px;
+            border-radius: 50%;
+            background: #ccc;
+            flex-shrink: 0;
+        }
+        .status-dot.connected { background: #3d9e5e; }
+        .status-dot.error { background: #d04a3c; }
+        .status-label {
+            font-size: 0.8125rem;
+            color: #6b7a6b;
+        }
+        .btn-test {
+            font-size: 0.8125rem;
+            font-family: 'Inter', sans-serif;
+            padding: 0.3rem 0.875rem;
+            border: 1px solid #c5ccc5;
+            border-radius: 4px;
+            background: transparent;
+            cursor: pointer;
+            color: #3a453a;
+            transition: background 0.15s;
+            margin-left: auto;
+        }
+        .btn-test:hover { background: #f0f2f0; }
+
+        /* Main layout */
+        .main { display: grid; grid-template-columns: 1fr 1fr; gap: 0; min-height: calc(100vh - 100px); }
+
+        /* Left panel: upload */
+        .panel-left {
+            padding: 2rem;
+            border-right: 1px solid #dde3dd;
+        }
+
+        .panel-label {
+            font-size: 0.6875rem;
+            font-weight: 600;
+            letter-spacing: 0.08em;
+            text-transform: uppercase;
+            color: #8a9a8a;
+            margin-bottom: 1rem;
+        }
+
+        .drop-zone {
+            border: 1.5px dashed #b8c4b8;
+            border-radius: 8px;
+            padding: 3rem 2rem;
+            text-align: center;
+            cursor: pointer;
+            transition: border-color 0.2s, background 0.2s;
+            background: #fafbfa;
+        }
+        .drop-zone:hover, .drop-zone.drag-over {
+            border-color: #3d9e5e;
+            background: #f4faf5;
+        }
+        .drop-icon {
+            font-size: 2rem;
+            color: #b8c4b8;
+            margin-bottom: 0.75rem;
+        }
+        .drop-text { font-size: 0.875rem; color: #6b7a6b; line-height: 1.5; }
+        .drop-text strong { color: #3a453a; font-weight: 500; }
+
+        .preview-wrap {
+            display: none;
+            margin-top: 1.5rem;
+            position: relative;
+        }
+        .preview-wrap img {
+            width: 100%;
+            border-radius: 6px;
+            border: 1px solid #dde3dd;
+            display: block;
+        }
+        .preview-badge {
+            position: absolute;
+            top: 8px; left: 8px;
+            background: rgba(26,31,26,0.75);
+            color: #e8ede8;
+            font-size: 0.6875rem;
+            font-family: 'IBM Plex Mono', monospace;
+            padding: 3px 8px;
+            border-radius: 3px;
+        }
+        .btn-clear {
+            position: absolute;
+            top: 8px; right: 8px;
+            background: rgba(26,31,26,0.75);
+            border: none;
+            color: #e8ede8;
+            width: 26px; height: 26px;
+            border-radius: 50%;
+            cursor: pointer;
+            font-size: 0.875rem;
+            display: flex; align-items: center; justify-content: center;
+            transition: background 0.15s;
+        }
+        .btn-clear:hover { background: rgba(208,74,60,0.85); }
+
+        /* Method badge */
+        .method-badge {
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+            font-size: 0.75rem;
+            font-family: 'IBM Plex Mono', monospace;
+            padding: 3px 10px;
+            border-radius: 3px;
+            margin-top: 1rem;
+        }
+        .method-vision { background: #e8f4ec; color: #2a6e3e; }
+        .method-ocr { background: #fef3e2; color: #8a5a00; }
+
+        /* Progress */
+        .progress-wrap {
+            display: none;
+            margin-top: 1.5rem;
+        }
+        .progress-steps { display: flex; flex-direction: column; gap: 0.5rem; }
+        .progress-step {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            font-size: 0.8125rem;
+            color: #8a9a8a;
+        }
+        .progress-step.active { color: #3a453a; }
+        .progress-step.done { color: #3d9e5e; }
+        .step-dot {
+            width: 8px; height: 8px;
+            border-radius: 50%;
+            background: #dde3dd;
+            flex-shrink: 0;
+        }
+        .progress-step.active .step-dot { background: #3a453a; animation: pulse 1s infinite; }
+        .progress-step.done .step-dot { background: #3d9e5e; }
+        @keyframes pulse { 0%,100%{ opacity:1 } 50%{ opacity:0.4 } }
+
+        /* Right panel: results */
+        .panel-right {
+            padding: 2rem;
+            background: #fff;
+            display: flex;
+            flex-direction: column;
+            gap: 1.5rem;
+        }
+
+        .empty-state {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            height: 100%;
+            color: #b8c4b8;
+            gap: 0.5rem;
+            text-align: center;
+        }
+        .empty-icon { font-size: 2.5rem; margin-bottom: 0.25rem; }
+        .empty-label { font-size: 0.8125rem; }
+
+        /* Result sections */
+        .result-section { display: none; }
+        .result-section.visible { display: block; }
+
+        .field-group {
+            border: 1px solid #dde3dd;
+            border-radius: 8px;
+            overflow: hidden;
+        }
+        .field-row {
+            display: grid;
+            grid-template-columns: 140px 1fr;
+            border-bottom: 1px solid #dde3dd;
+        }
+        .field-row:last-child { border-bottom: none; }
+        .field-key {
+            padding: 0.625rem 0.875rem;
+            font-size: 0.75rem;
+            color: #8a9a8a;
+            background: #fafbfa;
+            border-right: 1px solid #dde3dd;
+            display: flex;
+            align-items: center;
+        }
+        .field-val {
+            padding: 0.625rem 0.875rem;
+            font-size: 0.875rem;
+            color: #1a1f1a;
+            font-family: 'IBM Plex Mono', monospace;
+        }
+        .field-val.muted { color: #8a9a8a; font-family: 'Inter', sans-serif; font-style: italic; }
+
+        /* Validation card */
+        .validation-card {
+            border-radius: 8px;
+            padding: 1rem 1.25rem;
+            border: 1.5px solid;
+        }
+        .validation-card.pass { background: #f2faf5; border-color: #3d9e5e; }
+        .validation-card.fail { background: #fdf3f2; border-color: #d04a3c; }
+        .validation-card.info { background: #f2f6fd; border-color: #4a7fc1; }
+        .validation-title {
+            font-size: 0.875rem;
+            font-weight: 500;
+            margin-bottom: 0.25rem;
+        }
+        .validation-card.pass .validation-title { color: #1e6636; }
+        .validation-card.fail .validation-title { color: #922e22; }
+        .validation-card.info .validation-title { color: #2a4e82; }
+        .validation-body { font-size: 0.8125rem; color: #5a6a5a; line-height: 1.5; }
+
+        /* Final MGRS */
+        .final-block {
+            background: #1a1f1a;
+            color: #e8ede8;
+            border-radius: 8px;
+            padding: 1.25rem 1.5rem;
+        }
+        .final-label {
+            font-size: 0.6875rem;
+            font-weight: 600;
+            letter-spacing: 0.08em;
+            text-transform: uppercase;
+            color: #6b7a6b;
+            margin-bottom: 0.5rem;
+        }
+        .final-mgrs {
+            font-size: 1.75rem;
+            font-family: 'IBM Plex Mono', monospace;
+            font-weight: 500;
+            letter-spacing: 0.02em;
+            color: #e8ede8;
+        }
+        .final-note {
+            font-size: 0.75rem;
+            color: #6b7a6b;
+            margin-top: 0.25rem;
+            font-family: 'IBM Plex Mono', monospace;
+        }
+
+        /* Coords row */
+        .coords-row {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 1rem;
+        }
+        .coord-card {
+            border: 1px solid #dde3dd;
+            border-radius: 8px;
+            padding: 0.875rem 1rem;
+        }
+        .coord-card-label {
+            font-size: 0.6875rem;
+            font-weight: 600;
+            letter-spacing: 0.07em;
+            text-transform: uppercase;
+            color: #8a9a8a;
+            margin-bottom: 0.375rem;
+        }
+        .coord-card-val {
+            font-size: 0.9375rem;
+            font-family: 'IBM Plex Mono', monospace;
+            color: #1a1f1a;
+            font-weight: 500;
+        }
+
+        @media (max-width: 768px) {
+            .main { grid-template-columns: 1fr; }
+            .panel-left { border-right: none; border-bottom: 1px solid #dde3dd; }
+            .coords-row { grid-template-columns: 1fr; }
+        }
+    </style>
+</head>
+<body>
+
+<header class="app-header">
+    <h1>MGRS Validator</h1>
+    <span class="subtitle">herbarium specimen · coordinate verification</span>
+</header>
+
+<div class="status-bar">
+    <div class="status-dot" id="statusDot"></div>
+    <span class="status-label" id="statusLabel">Backend not tested</span>
+    <button class="btn-test" id="testBtn">Test connection</button>
+</div>
+
+<div class="main">
+    <!-- LEFT: Upload + progress -->
+    <div class="panel-left">
+        <div class="panel-label">Specimen image</div>
+
+        <div class="drop-zone" id="dropZone">
+            <input type="file" id="fileInput" accept="image/*" style="display:none">
+            <div class="drop-icon">↑</div>
+            <div class="drop-text">
+                <strong>Click to select</strong> or drag a photo here<br>
+                JPG, PNG, TIFF — herbarium label visible
+            </div>
+        </div>
+
+        <div class="preview-wrap" id="previewWrap">
+            <img id="imagePreview" alt="Specimen preview">
+            <span class="preview-badge" id="methodBadge">—</span>
+            <button class="btn-clear" id="clearBtn" title="Clear image">✕</button>
+        </div>
+
+        <div class="progress-wrap" id="progressWrap">
+            <div class="progress-steps" id="progressSteps">
+                <div class="progress-step" id="step-vision">
+                    <div class="step-dot"></div>
+                    <span>Qwen VL — reading label via vision</span>
+                </div>
+                <div class="progress-step" id="step-ocr">
+                    <div class="step-dot"></div>
+                    <span>OCR fallback (Tesseract)</span>
+                </div>
+                <div class="progress-step" id="step-geocode">
+                    <div class="step-dot"></div>
+                    <span>Geocoding locality name</span>
+                </div>
+                <div class="progress-step" id="step-convert">
+                    <div class="step-dot"></div>
+                    <span>Converting to MGRS</span>
+                </div>
+                <div class="progress-step" id="step-validate">
+                    <div class="step-dot"></div>
+                    <span>Validating 100 km square</span>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- RIGHT: Results -->
+    <div class="panel-right">
+        <div class="empty-state" id="emptyState">
+            <div class="empty-icon">◻</div>
+            <div class="empty-label">Upload a specimen image to begin</div>
+        </div>
+
+        <div class="result-section" id="resultsAll">
+
+            <div>
+                <div class="panel-label">Extracted data</div>
+                <div class="field-group">
+                    <div class="field-row">
+                        <div class="field-key">Species</div>
+                        <div class="field-val" id="rSpecies">—</div>
+                    </div>
+                    <div class="field-row">
+                        <div class="field-key">Recorded MGRS</div>
+                        <div class="field-val" id="rMGRS">—</div>
+                    </div>
+                    <div class="field-row">
+                        <div class="field-key">Locality</div>
+                        <div class="field-val" id="rLocality">—</div>
+                    </div>
+                    <div class="field-row">
+                        <div class="field-key">Collector</div>
+                        <div class="field-val" id="rCollector">—</div>
+                    </div>
+                    <div class="field-row">
+                        <div class="field-key">Date</div>
+                        <div class="field-val" id="rDate">—</div>
+                    </div>
+                    <div class="field-row">
+                        <div class="field-key">Extraction via</div>
+                        <div class="field-val" id="rMethod">—</div>
+                    </div>
+                </div>
+            </div>
+
+            <div>
+                <div class="panel-label">Calculated coordinates</div>
+                <div class="coords-row">
+                    <div class="coord-card">
+                        <div class="coord-card-label">Lat / Lon</div>
+                        <div class="coord-card-val" id="rLatLon">—</div>
+                    </div>
+                    <div class="coord-card">
+                        <div class="coord-card-label">Derived MGRS</div>
+                        <div class="coord-card-val" id="rCalcMGRS">—</div>
+                    </div>
+                </div>
+            </div>
+
+            <div>
+                <div class="panel-label">Validation</div>
+                <div id="validationCard"></div>
+            </div>
+
+            <div class="final-block">
+                <div class="final-label">Corrected MGRS</div>
+                <div class="final-mgrs" id="finalMGRS">—</div>
+                <div class="final-note" id="finalNote">—</div>
+            </div>
+
+        </div>
+    </div>
+</div>
+
+<script>
+// ─── Config ───────────────────────────────────────────────────────────────────
+const BACKEND_URL = 'http://localhost:5000/api/chat';
+const VISION_MODEL = 'qwen3-vl-plus';   // vision-capable
+const TEXT_MODEL   = 'qwen-plus';        // text-only fallback
+
+// ─── MGRS Converter ───────────────────────────────────────────────────────────
+const MGRS = {
+    degToRad(d) { return d * Math.PI / 180; },
+    getUTMZone(lat, lon) { return Math.floor((lon + 180) / 6) + 1; },
+    getLatBand(lat) { return 'CDEFGHJKLMNPQRSTUVWX'[Math.floor((lat + 80) / 8)] || 'M'; },
+
+    toUTM(lat, lon) {
+        const z = this.getUTMZone(lat, lon);
+        const cm = (z - 1) * 6 - 180 + 3;
+        const a = 6378137, e2 = 0.00669437999014, e4 = e2*e2, e6 = e4*e2;
+        const e = Math.sqrt(e2);
+        const latR = this.degToRad(lat);
+        const lonDiff = (lon - cm) * Math.PI / 180;
+        const N = a / Math.sqrt(1 - e2 * Math.sin(latR)**2);
+        const T = Math.tan(latR)**2;
+        const C = e2/(1-e2) * Math.cos(latR)**2;
+        const A = lonDiff * Math.cos(latR);
+        const M = a*((1-e2/4-3*e4/64-5*e6/256)*latR-(3*e2/8+3*e4/32+45*e6/1024)*Math.sin(2*latR)+(15*e4/256+45*e6/1024)*Math.sin(4*latR)-(35*e6/3072)*Math.sin(6*latR));
+        const E = 0.9996*N*(A+(1-T+C)*A**3/6+(5-18*T+T**2+72*C-58*e2/(1-e2))*A**5/120)+500000;
+        let Nv = 0.9996*(M+N*Math.tan(latR)*(A**2/2+(5-T+9*C+4*C**2)*A**4/24+(61-58*T+T**2+600*C-330*e2/(1-e2))*A**6/720));
+        if (lat < 0) Nv += 10000000;
+        return { zone: z, easting: E, northing: Nv };
+    },
+
+    get100km(zone, easting, northing) {
+        const col = 'ABCDEFGHJKLMNPQRSTUVWXYZ';
+        const row = 'ABCDEFGHJKLMNPQRSTUV';
+        let ci = Math.floor(easting / 100000) - 1;
+        ci = zone % 2 === 1 ? ci % 8 : (ci + 8) % 8;
+        let ri = zone % 2 === 1
+            ? Math.floor((northing % 2000000) / 100000)
+            : Math.floor(((northing + 1000000) % 2000000) / 100000);
+        ri = ri % 20;
+        return col[ci] + row[ri];
+    },
+
+    fromLatLon(lat, lon) {
+        const utm = this.toUTM(lat, lon);
+        const sq  = this.get100km(utm.zone, utm.easting, utm.northing);
+        const band = this.getLatBand(lat);
+        const e = Math.floor(utm.easting  % 100000).toString().padStart(5,'0');
+        const n = Math.floor(utm.northing % 100000).toString().padStart(5,'0');
+        return { full: `${utm.zone}${band} ${sq} ${e} ${n}`, square: sq };
+    },
+
+    parse100km(str) {
+        if (!str) return null;
+        const m = str.toUpperCase().replace(/\s+/g,'').match(/(\d{1,2})([C-XY])([A-HJ-NP-Z]{2})/);
+        return m ? m[3] : null;
+    }
+};
+
+// ─── API helpers ──────────────────────────────────────────────────────────────
+async function callAPI(model, messages) {
+    const res = await fetch(BACKEND_URL, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ model, messages, temperature: 0.1 })
+    });
+    if (!res.ok) throw new Error(`Backend ${res.status}`);
+    const data = await res.json();
+    return data.choices[0].message.content;
+}
+
+async function visionExtract(base64, mimeType) {
+    const prompt = `You are a botanical data extraction assistant specialising in Kenyan herbarium specimens. Examine this herbarium specimen label carefully.
+
+Extract and return ONLY valid JSON with these fields:
+{
+  "species_name": "full scientific name or null",
+  "mgrs_coordinates": "MGRS string exactly as written on the label, or null if not present",
+  "locality": "the most specific place name you can find — town, village, area, hill, river, forest, or administrative location within Kenya. Extract just the place name(s), not a full sentence. If multiple place names appear, pick the most specific one. Return null only if no place name is visible.",
+  "collection_date": "date as written or null",
+  "collector": "collector name(s) or null"
+}
+
+IMPORTANT RULES:
+- For locality: prefer specific Kenyan place names (e.g. 'Karura Forest', 'Thika', 'Mt Kenya', 'Arabuko-Sokoke') over vague descriptions like 'near river' or 'forest edge'. If both appear, return the named place.
+- For mgrs_coordinates: copy the value EXACTLY as written, including any spaces or formatting. If no MGRS grid reference appears on the label, return null — do not guess or infer one.
+- If MGRS is null, the locality will be used to calculate coordinates, so accuracy of the locality field is critical.
+
+Return only the JSON object, no other text.`;
+
+    const messages = [{
+        role: 'user',
+        content: [
+            { type: 'image_url', image_url: { url: `data:${mimeType};base64,${base64}` } },
+            { type: 'text', text: prompt }
+        ]
+    }];
+    const raw = await callAPI(VISION_MODEL, messages);
+    const match = raw.match(/\{[\s\S]*\}/);
+    return JSON.parse(match ? match[0] : '{}');
+}
+
+async function textExtract(ocrText) {
+    const prompt = `You are a botanical data extraction assistant specialising in Kenyan herbarium specimens. Extract specimen data from this OCR text and return ONLY valid JSON:
+{
+  "species_name": "full scientific name or null",
+  "mgrs_coordinates": "MGRS string exactly as written, or null if not present",
+  "locality": "most specific Kenyan place name found — town, village, area, hill, river, forest, or county. Return just the place name, not a full sentence. null only if truly absent.",
+  "collection_date": "date as written or null",
+  "collector": "collector name(s) or null"
+}
+
+IMPORTANT RULES:
+- For locality: prefer specific named Kenyan places (e.g. 'Limuru', 'Tsavo East', 'Rift Valley', 'Kakamega Forest') over vague descriptions. If multiple place names appear, return the most specific.
+- For mgrs_coordinates: copy EXACTLY as written. If no MGRS grid reference is present in the text, return null — do not invent one.
+- If mgrs_coordinates is null, the locality field will be geocoded to derive coordinates, so it must be as accurate as possible.
+
+OCR TEXT:
+${ocrText}`;
+
+    const raw = await callAPI(TEXT_MODEL, [
+        { role: 'system', content: 'Return only valid JSON. No markdown, no explanation.' },
+        { role: 'user', content: prompt }
+    ]);
+    const match = raw.match(/\{[\s\S]*\}/);
+    return JSON.parse(match ? match[0] : '{}');
+}
+
+// Kenya bounding box: lat -4.7 to 5.0, lon 33.9 to 41.9
+const KENYA_BOUNDS = { minLat: -4.7, maxLat: 5.0, minLon: 33.9, maxLon: 41.9 };
+
+function isInKenya(lat, lon) {
+    return lat >= KENYA_BOUNDS.minLat && lat <= KENYA_BOUNDS.maxLat &&
+           lon >= KENYA_BOUNDS.minLon && lon <= KENYA_BOUNDS.maxLon;
+}
+
+async function geocode(locality) {
+    // Try Kenya-constrained search first using countrycodes and viewbox
+    const kenyaViewbox = '33.9,-4.7,41.9,5.0'; // minLon,minLat,maxLon,maxLat
+    const queries = [
+        // 1. Strict Kenya country code search
+        `https://nominatim.openstreetmap.org/search?format=json&q=${encodeURIComponent(locality + ', Kenya')}&countrycodes=ke&limit=3`,
+        // 2. Viewbox-bounded search (catches places Nominatim might not tag as KE)
+        `https://nominatim.openstreetmap.org/search?format=json&q=${encodeURIComponent(locality)}&viewbox=${kenyaViewbox}&bounded=1&limit=3`,
+        // 3. Unbounded fallback — accepted only if result falls within Kenya bbox
+        `https://nominatim.openstreetmap.org/search?format=json&q=${encodeURIComponent(locality)}&limit=5`
+    ];
+
+    for (let i = 0; i < queries.length; i++) {
+        try {
+            const res = await fetch(queries[i], { headers: { 'Accept-Language': 'en' } });
+            const data = await res.json();
+            for (const item of data) {
+                const lat = parseFloat(item.lat);
+                const lon = parseFloat(item.lon);
+                if (isInKenya(lat, lon)) {
+                    return { lat, lon, display: item.display_name };
+                }
+            }
+        } catch(e) { console.warn(`Geocode query ${i+1} failed:`, e); }
+    }
+    return null; // no Kenya result found
+}
+
+// ─── UI helpers ───────────────────────────────────────────────────────────────
+function setStep(id, state) {
+    const el = document.getElementById(id);
+    el.className = 'progress-step ' + state;
+}
+
+function showResults(extracted, coords, calcMGRS, method) {
+    document.getElementById('emptyState').style.display = 'none';
+    document.getElementById('resultsAll').classList.add('visible');
+
+    const val = (v) => v || '<span class="muted">not found</span>';
+    document.getElementById('rSpecies').innerHTML   = extracted.species_name   || '<span style="color:#8a9a8a;font-style:italic;font-family:Inter,sans-serif">not found</span>';
+    document.getElementById('rMGRS').innerText      = extracted.mgrs_coordinates || '—';
+    document.getElementById('rLocality').innerText  = extracted.locality || '—';
+    document.getElementById('rCollector').innerText = extracted.collector || '—';
+    document.getElementById('rDate').innerText      = extracted.collection_date || '—';
+    document.getElementById('rMethod').innerText    = method;
+
+    if (coords) {
+        document.getElementById('rLatLon').innerText   = `${coords.lat.toFixed(6)}°, ${coords.lon.toFixed(6)}°`;
+        document.getElementById('rCalcMGRS').innerText = calcMGRS.full;
+    } else {
+        document.getElementById('rLatLon').innerText   = 'Not resolved';
+        document.getElementById('rCalcMGRS').innerText = '—';
+    }
+
+    const vCard = document.getElementById('validationCard');
+    let finalMGRS = calcMGRS ? calcMGRS.full : '—';
+    let finalNote = 'calculated from locality';
+
+    if (!extracted.locality && !extracted.mgrs_coordinates) {
+        vCard.innerHTML = `<div class="validation-card fail"><div class="validation-title">No coordinates or locality found</div><div class="validation-body">The label contains neither an MGRS reference nor a recognisable place name. Check image quality and try again.</div></div>`;
+        finalMGRS = '—';
+        finalNote = 'insufficient data on label';
+    } else if (!coords && !extracted.mgrs_coordinates) {
+        const localityStr = extracted.locality ? `"${extracted.locality}"` : 'the extracted locality';
+        vCard.innerHTML = `<div class="validation-card fail"><div class="validation-title">Locality not found in Kenya</div><div class="validation-body">${localityStr} could not be matched to a location within Kenya. The place name may be misspelled, too vague, or outside Kenya's boundaries.</div></div>`;
+        finalMGRS = '—';
+        finalNote = 'geocoding failed — locality unresolved';
+    } else if (!extracted.mgrs_coordinates) {
+        const placeLabel = coords.display ? coords.display.split(',')[0] : extracted.locality;
+        vCard.innerHTML = `<div class="validation-card info"><div class="validation-title">No MGRS on label — derived from locality</div><div class="validation-body">No MGRS grid reference was found on the label. Locality <strong>"${extracted.locality}"</strong> was geocoded to <strong>${coords.lat.toFixed(4)}°, ${coords.lon.toFixed(4)}°</strong> (matched: ${placeLabel}) and converted to MGRS.</div></div>`;
+        finalNote = 'no MGRS on label — derived from locality geocode';
+    } else if (!coords) {
+        vCard.innerHTML = `<div class="validation-card info"><div class="validation-title">MGRS present — locality unresolved</div><div class="validation-body">An MGRS value was found on the label but the locality could not be geocoded within Kenya, so cross-validation was not possible. Using recorded MGRS.</div></div>`;
+        finalMGRS = extracted.mgrs_coordinates;
+        finalNote = 'recorded MGRS used — locality unresolved';
+    } else {
+        const recSq  = MGRS.parse100km(extracted.mgrs_coordinates);
+        const calcSq = calcMGRS.square;
+        if (recSq === calcSq) {
+            vCard.innerHTML = `<div class="validation-card pass"><div class="validation-title">Validation passed</div><div class="validation-body">100 km square matches: <strong>${recSq}</strong>. Recorded MGRS is consistent with the locality.</div></div>`;
+            finalMGRS = extracted.mgrs_coordinates;
+            finalNote = 'recorded MGRS validated against locality';
+        } else {
+            vCard.innerHTML = `<div class="validation-card fail"><div class="validation-title">100 km square mismatch</div><div class="validation-body">Recorded square <strong>${recSq}</strong> does not match calculated square <strong>${calcSq}</strong>. Using corrected MGRS derived from locality.</div></div>`;
+            finalNote = 'corrected — recorded square was wrong';
+        }
+    }
+
+    document.getElementById('finalMGRS').innerText = finalMGRS;
+    document.getElementById('finalNote').innerText  = finalNote;
+    document.getElementById('methodBadge').innerText = method;
+}
+
+// ─── Main processing pipeline ─────────────────────────────────────────────────
+async function processFile(file) {
+    // Reset UI
+    document.getElementById('progressWrap').style.display = 'block';
+    document.getElementById('emptyState').style.display   = 'none';
+    document.getElementById('resultsAll').classList.remove('visible');
+    ['step-vision','step-ocr','step-geocode','step-convert','step-validate'].forEach(s => setStep(s,''));
+
+    let extracted = null;
+    let method = '';
+    let base64 = null;
+    const mimeType = file.type || 'image/jpeg';
+
+    // ── Step 1: Vision extraction ──────────────────────────────────────────────
+    setStep('step-vision', 'active');
+    try {
+        base64 = await new Promise((res, rej) => {
+            const r = new FileReader();
+            r.onload = () => res(r.result.split(',')[1]);
+            r.onerror = rej;
+            r.readAsDataURL(file);
+        });
+        extracted = await visionExtract(base64, mimeType);
+        method = 'qwen3-vl-plus (vision)';
+        setStep('step-vision', 'done');
+        setStep('step-ocr', 'done'); // skipped
+    } catch(e) {
+        console.warn('Vision extraction failed:', e);
+        setStep('step-vision', '');
+
+        // ── Step 2: OCR fallback ───────────────────────────────────────────────
+        setStep('step-ocr', 'active');
+        try {
+            const result = await Tesseract.recognize(file, 'eng');
+            extracted = await textExtract(result.data.text);
+            method = 'tesseract OCR + qwen-plus';
+            setStep('step-ocr', 'done');
+        } catch(e2) {
+            console.error('OCR fallback also failed:', e2);
+            setStep('step-ocr', '');
+            extracted = {};
+            method = 'extraction failed';
+        }
+    }
+
+    // ── Step 3: Geocode locality ───────────────────────────────────────────────
+    setStep('step-geocode', 'active');
+    let coords = null;
+    if (extracted.locality) {
+        try {
+            coords = await geocode(extracted.locality);
+        } catch(e) { console.warn('Geocoding failed:', e); }
+    }
+    setStep('step-geocode', coords ? 'done' : '');
+
+    // ── Step 4: Convert to MGRS ───────────────────────────────────────────────
+    setStep('step-convert', 'active');
+    let calcMGRS = null;
+    if (coords) {
+        calcMGRS = MGRS.fromLatLon(coords.lat, coords.lon);
+    }
+    setStep('step-convert', calcMGRS ? 'done' : '');
+
+    // ── Step 5: Validate ──────────────────────────────────────────────────────
+    setStep('step-validate', 'active');
+    setTimeout(() => {
+        setStep('step-validate', 'done');
+        document.getElementById('progressWrap').style.display = 'none';
+        showResults(extracted, coords, calcMGRS, method);
+    }, 300);
+}
+
+// ─── Events ───────────────────────────────────────────────────────────────────
+const dropZone   = document.getElementById('dropZone');
+const fileInput  = document.getElementById('fileInput');
+const previewWrap = document.getElementById('previewWrap');
+const imagePreview = document.getElementById('imagePreview');
+
+dropZone.addEventListener('click', () => fileInput.click());
+dropZone.addEventListener('dragover', e => { e.preventDefault(); dropZone.classList.add('drag-over'); });
+dropZone.addEventListener('dragleave', () => dropZone.classList.remove('drag-over'));
+dropZone.addEventListener('drop', e => {
+    e.preventDefault();
+    dropZone.classList.remove('drag-over');
+    if (e.dataTransfer.files[0]) handleFile(e.dataTransfer.files[0]);
+});
+fileInput.addEventListener('change', e => { if (e.target.files[0]) handleFile(e.target.files[0]); });
+document.getElementById('clearBtn').addEventListener('click', () => {
+    previewWrap.style.display = 'none';
+    fileInput.value = '';
+    document.getElementById('resultsAll').classList.remove('visible');
+    document.getElementById('emptyState').style.display = 'flex';
+    document.getElementById('progressWrap').style.display = 'none';
+});
+
+function handleFile(file) {
+    const reader = new FileReader();
+    reader.onload = e => {
+        imagePreview.src = e.target.result;
+        previewWrap.style.display = 'block';
+        processFile(file);
+    };
+    reader.readAsDataURL(file);
+}
+
+// ─── Connection test ──────────────────────────────────────────────────────────
+document.getElementById('testBtn').addEventListener('click', async () => {
+    const dot   = document.getElementById('statusDot');
+    const label = document.getElementById('statusLabel');
+    dot.className = 'status-dot';
+    label.innerText = 'Testing…';
+    try {
+        await callAPI(TEXT_MODEL, [{ role: 'user', content: 'ping' }]);
+        dot.className = 'status-dot connected';
+        label.innerText = 'Backend connected · ' + BACKEND_URL;
+    } catch(e) {
+        dot.className = 'status-dot error';
+        label.innerText = 'Connection failed — is python backend.py running?';
+    }
+});
+</script>
+</body>
+</html>
