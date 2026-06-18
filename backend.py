@@ -41,6 +41,7 @@ def proxy_chat():
         }), response.status_code
 
 if __name__ == '__main__':
-    print("✅ Backend server running on http://localhost:5000")
-    print("Keep this window open while using the web app!\n")
-    app.run(port=5000, debug=True)
+    print("✅ Backend server running on port 5000")
+    port = int(os.environ.get('PORT', 5000))
+    app.run(host='0.0.0.0', port=port)
+    
