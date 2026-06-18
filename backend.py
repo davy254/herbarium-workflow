@@ -4,7 +4,10 @@ import requests
 import os
 
 app = Flask(__name__)
-CORS(app) 
+CORS(app, origins=[
+    "http://localhost:5500",           # for local development
+    "https://davy254.github.io"   # for live frontend
+])
 
 API_KEY = "sk-mr-3c4d1d7c7bc043b6dcab8d40f8e523263fca0fb515611275370141962985fb3a"
 API_URL = "https://api.mulerouter.ai/vendors/openai/v1/chat/completions"
