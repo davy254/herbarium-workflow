@@ -493,16 +493,26 @@ const MGRS = {
         return { zone: z, easting: E, northing: Nv };
     },
 
+    // ── 100km square letter lookup tables (NGA-compliant MGRS standard) ────────
+    // Column letters (A-Z excl. I,O) cycle in 3 groups of 8, repeating every
+    // 3 UTM zones. Row letters (A-V excl. I,O) cycle in 2 groups of 20,
+    // alternating by zone parity — even zones are offset, starting at 'F'.
+    E100K_LETTERS: ['ABCDEFGH', 'JKLMNPQR', 'STUVWXYZ'],
+    N100K_LETTERS: ['ABCDEFGHJKLMNPQRSTUV', 'FGHJKLMNPQRSTUVABCDE'],
+
+    get100kSetForZone(zone) {
+        let setNum = zone % 6;
+        if (setNum === 0) setNum = 6;
+        return setNum;
+    },
+
     get100km(zone, easting, northing) {
-        const col = 'ABCDEFGHJKLMNPQRSTUVWXYZ';
-        const row = 'ABCDEFGHJKLMNPQRSTUV';
-        let ci = Math.floor(easting / 100000) - 1;
-        ci = zone % 2 === 1 ? ci % 8 : (ci + 8) % 8;
-        let ri = zone % 2 === 1
-            ? Math.floor((northing % 2000000) / 100000)
-            : Math.floor(((northing + 1000000) % 2000000) / 100000);
-        ri = ri % 20;
-        return col[ci] + row[ri];
+        const set = this.get100kSetForZone(zone);
+        const colBlock = (set - 1) % 3;
+        const rowBlock = (set % 2 === 0) ? 1 : 0;
+        const colIndex = Math.floor(easting / 100000) - 1;   // 1..8 → 0..7
+        const rowIndex = Math.floor(northing / 100000) % 20;
+        return this.E100K_LETTERS[colBlock][colIndex] + this.N100K_LETTERS[rowBlock][rowIndex];
     },
 
     fromLatLon(lat, lon) {
@@ -561,31 +571,85 @@ async function callAPI(model, messages) {
     return data.choices[0].message.content;
 }
 
-async function spellCheckLocality(locality) {
+// Step 1: ask the LLM for spelling correction, but treat it as a SUGGESTION only.
+// We never trust this blindly — it gets verified against GeoNames before use.
+async function suggestSpellingCorrection(locality) {
     if (!locality) return locality;
-    const prompt = `You are a Kenyan geography expert. The following locality string was extracted from a herbarium specimen label and may contain spelling errors in place names.
+    const prompt = `You are a Kenyan geography expert reviewing OCR/vision output from a herbarium label. The text may contain a minor OCR misread of a place name.
 
-Locality: "${locality}"
+Locality as read: "${locality}"
 
-Your task:
-1. Identify any misspelled Kenyan place names (towns, hills, roads, areas, forests, rivers).
-2. Correct only the spelling of place names — do not rephrase, reorder, or remove any other text.
-3. Common Kenyan spelling errors to watch for: Nong→Ngong, Naivasha variants, Limuru variants, diacritics dropped from Maasai names, etc.
-4. If no spelling errors are found, return the original string unchanged.
+Rules:
+- Only propose a change if you are HIGHLY confident the original is a misread of a well-known Kenyan place name (e.g. a single swapped/missing letter, like "Nong"→"Ngong" or "Kiserian" misread as "Kisirani").
+- Do NOT invent or guess unfamiliar place names. If uncertain, return the input UNCHANGED.
+- Do NOT rephrase, reorder, translate, or add words — only fix obvious letter-level misreads in place names.
+- If the string already looks like a plausible, real Kenyan place name, return it UNCHANGED even if you don't recognise it specifically.
 
-Return ONLY the corrected locality string, no explanation, no quotes.`;
+Return ONLY the (possibly corrected) locality string, no explanation, no quotes.`;
 
     try {
         const corrected = await callAPI(TEXT_MODEL, [
-            { role: 'system', content: 'You are a Kenyan geography expert. Return only the corrected locality string.' },
+            { role: 'system', content: 'You are conservative and cautious. When unsure, return the input unchanged.' },
             { role: 'user', content: prompt }
         ]);
         const cleaned = corrected.trim().replace(/^["']|["']$/g, '');
         return cleaned || locality;
     } catch(e) {
-        console.warn('Spell-check failed, using original locality:', e);
+        console.warn('Spelling suggestion failed, using original locality:', e);
         return locality;
     }
+}
+
+// Step 2: verify a candidate locality string actually resolves to a real place
+// in Kenya via GeoNames/Nominatim. Returns the geocode result if found, else null.
+async function verifyLocalityResolves(locality) {
+    const variants = extractLocalityVariants(locality);
+    for (const variant of variants) {
+        const geoResult = await geocodeGeoNames(variant);
+        if (geoResult) return { ...geoResult, matchedTerm: variant };
+        const nomResult = await geocodeNominatim(variant);
+        if (nomResult) return { ...nomResult, matchedTerm: variant };
+    }
+    return null;
+}
+
+// Main entry point: tries the ORIGINAL locality first. Only falls back to the
+// LLM's spelling suggestion if the original fails to geocode AND the suggestion
+// is different AND the suggestion itself successfully geocodes.
+// This guarantees we never "correct" a name that was already right, and never
+// accept a correction that doesn't actually resolve to a real place.
+async function spellCheckLocality(locality) {
+    if (!locality) return { corrected: locality, coords: null };
+
+    // 1. Try the original as-extracted first — it may already be correct
+    //    (as in the Lolgorien case, where vision read it correctly).
+    const originalMatch = await verifyLocalityResolves(locality);
+    if (originalMatch) {
+        console.log(`Original locality "${locality}" resolved directly — no correction needed`);
+        return { corrected: locality, coords: originalMatch };
+    }
+
+    // 2. Original didn't resolve — ask the LLM for a cautious suggestion
+    const suggestion = await suggestSpellingCorrection(locality);
+    if (suggestion === locality) {
+        // LLM agreed there's nothing to change, and original didn't resolve.
+        // Try original variants again via geocode() in the main pipeline —
+        // it has broader fallback logic than verifyLocalityResolves.
+        return { corrected: locality, coords: null };
+    }
+
+    // 3. LLM proposed a different spelling — verify IT resolves before trusting it
+    const suggestionMatch = await verifyLocalityResolves(suggestion);
+    if (suggestionMatch) {
+        console.log(`Locality corrected: "${locality}" → "${suggestion}" (verified via ${suggestionMatch.source})`);
+        return { corrected: suggestion, coords: suggestionMatch };
+    }
+
+    // 4. Suggestion also failed to resolve — keep the original rather than
+    //    introduce an unverified guess. Let the main geocode() pipeline make
+    //    one more broad attempt on the original.
+    console.warn(`LLM suggestion "${suggestion}" did not resolve either — keeping original "${locality}"`);
+    return { corrected: locality, coords: null };
 }
 
 
@@ -662,17 +726,45 @@ function isInKenya(lat, lon) {
 // GeoNames has deep coverage of small Kenyan localities, villages, hills,
 // forests and rivers sourced from NGA/NIMA gazetteers — often finds places
 // that Nominatim misses entirely.
+// Simple Levenshtein distance for sanity-checking fuzzy geocode matches
+function levenshtein(a, b) {
+    a = a.toLowerCase(); b = b.toLowerCase();
+    const dp = Array.from({length: a.length + 1}, (_, i) => [i, ...Array(b.length).fill(0)]);
+    for (let j = 0; j <= b.length; j++) dp[0][j] = j;
+    for (let i = 1; i <= a.length; i++) {
+        for (let j = 1; j <= b.length; j++) {
+            dp[i][j] = a[i-1] === b[j-1]
+                ? dp[i-1][j-1]
+                : 1 + Math.min(dp[i-1][j], dp[i][j-1], dp[i-1][j-1]);
+        }
+    }
+    return dp[a.length][b.length];
+}
+
+// Returns true if `candidate` is plausibly an OCR/spelling variant of `query`
+// — short edit distance relative to string length, not a totally different name.
+function isPlausibleMatch(query, candidate) {
+    const dist = levenshtein(query, candidate);
+    const maxLen = Math.max(query.length, candidate.length);
+    return dist <= Math.max(2, Math.ceil(maxLen * 0.35)); // allow ~35% character difference
+}
+
 async function geocodeGeoNames(locality) {
-    // Try two GeoNames endpoints:
+    // Try multiple GeoNames strategies, from exact to fuzzy:
     // (a) searchJSON — full-text search, country-restricted to Kenya
-    // (b) searchJSON with fuzzy matching (name_startsWith) for partial names
+    // (b) searchJSON with name= exact field match
+    // (c) fuzzy=0.6 — Levenshtein-based fuzzy match, tolerates OCR noise like
+    //     "Lolgories" vs "Lolgorien" (transposed/substituted letters)
+    // (d) name_startsWith — prefix match, catches truncated reads
+    const base = `https://secure.geonames.org/searchJSON?country=KE&maxRows=5&lang=en&username=${GEONAMES_USER}`;
     const endpoints = [
-        `https://secure.geonames.org/searchJSON?q=${encodeURIComponent(locality)}&country=KE&maxRows=5&lang=en&username=${GEONAMES_USER}`,
-        `https://secure.geonames.org/searchJSON?name=${encodeURIComponent(locality)}&country=KE&maxRows=5&lang=en&username=${GEONAMES_USER}`,
-        `https://secure.geonames.org/searchJSON?name_startsWith=${encodeURIComponent(locality)}&country=KE&maxRows=5&lang=en&username=${GEONAMES_USER}`
+        { url: `${base}&q=${encodeURIComponent(locality)}`, requireSimilar: false },
+        { url: `${base}&name=${encodeURIComponent(locality)}`, requireSimilar: false },
+        { url: `${base}&name=${encodeURIComponent(locality)}&fuzzy=0.6`, requireSimilar: true },
+        { url: `${base}&name_startsWith=${encodeURIComponent(locality)}`, requireSimilar: true }
     ];
 
-    for (const url of endpoints) {
+    for (const { url, requireSimilar } of endpoints) {
         try {
             const res  = await fetch(url);
             const data = await res.json();
@@ -680,14 +772,18 @@ async function geocodeGeoNames(locality) {
                 for (const place of data.geonames) {
                     const lat = parseFloat(place.lat);
                     const lon = parseFloat(place.lng);
-                    if (isInKenya(lat, lon)) {
-                        return {
-                            lat,
-                            lon,
-                            display: place.name + (place.adminName1 ? ', ' + place.adminName1 : '') + ', Kenya',
-                            source: 'GeoNames'
-                        };
-                    }
+                    if (!isInKenya(lat, lon)) continue;
+                    // For fuzzy/prefix matches, require the result name to actually
+                    // resemble the query — prevents accepting an unrelated place
+                    // just because it happened to rank first.
+                    if (requireSimilar && !isPlausibleMatch(locality, place.name)) continue;
+                    return {
+                        lat,
+                        lon,
+                        display: place.name + (place.adminName1 ? ', ' + place.adminName1 : '') + ', Kenya',
+                        source: 'GeoNames',
+                        matchedName: place.name
+                    };
                 }
             }
         } catch(e) { console.warn('GeoNames query failed:', e); }
@@ -731,25 +827,77 @@ async function geocodeNominatim(locality) {
 }
 
 // ── Main geocode: GeoNames → Nominatim ───────────────────────────────────────
+// Breaks a compound locality string into ordered candidate search terms.
+// Handles patterns like:
+//   "Lamu (Kiunga Shops)"      → ["Kiunga Shops", "Kiunga", "Lamu", "Lamu (Kiunga Shops)"]
+//   "Nong Hills, W of Kiserian" → ["Nong Hills", "Kiserian", "Nong Hills, W of Kiserian"]
+//   "Ngong Hills area"          → ["Ngong Hills", "Ngong", "Ngong Hills area"]
+function extractLocalityVariants(locality) {
+    const variants = [];
+    const seen = new Set();
+    const add = (s) => {
+        const t = s.trim().replace(/\s+/g, ' ');
+        if (t && !seen.has(t.toLowerCase())) { seen.add(t.toLowerCase()); variants.push(t); }
+    };
+
+    // 1. Content inside parentheses — usually the most specific named place
+    //    e.g. "Lamu (Kiunga Shops)" → "Kiunga Shops"
+    const parenMatch = locality.match(/\(([^)]+)\)/);
+    if (parenMatch) {
+        add(parenMatch[1]);
+        // Also try just the first word of the parenthetical (e.g. "Kiunga" from "Kiunga Shops")
+        const firstWord = parenMatch[1].trim().split(/\s+/)[0];
+        if (firstWord.length > 2) add(firstWord);
+    }
+
+    // 2. Content before parentheses — usually the broader area/county
+    //    e.g. "Lamu (Kiunga Shops)" → "Lamu"
+    const beforeParen = locality.split('(')[0].trim();
+    if (beforeParen && beforeParen !== locality) add(beforeParen);
+
+    // 3. Split on common separators: comma, "W of", "E of", "N of", "S of", "along", "near"
+    const parts = locality
+        .replace(/\([^)]*\)/g, '') // strip parens content already tried
+        .split(/,|\bW of\b|\bE of\b|\bN of\b|\bS of\b|\balong\b|\bnear\b/i)
+        .map(p => p.trim())
+        .filter(p => p.length > 2);
+    parts.forEach(add);
+
+    // 4. Strip generic suffixes like "Hills", "area", "shops", "Road", "Rd" to get bare place name
+    //    e.g. "Ngong Hills" → "Ngong", "Nong Hills area" → "Nong"
+    const stripped = locality.match(/^([A-Za-z\u00C0-\u017F]+)/);
+    if (stripped) {
+        const bare = stripped[1].trim();
+        if (bare.length > 2) add(bare);
+    }
+
+    // 5. Full original string as last resort
+    add(locality);
+
+    return variants;
+}
+
 async function geocode(locality) {
-    console.log(`Geocoding: "${locality}"`);
+    const variants = extractLocalityVariants(locality);
+    console.log(`Geocoding "${locality}" — trying variants:`, variants);
 
-    // 1. Try GeoNames first
-    const geoResult = await geocodeGeoNames(locality);
-    if (geoResult) {
-        console.log(`✅ GeoNames: ${geoResult.display} (${geoResult.lat}, ${geoResult.lon})`);
-        return geoResult;
+    for (const variant of variants) {
+        // Try GeoNames first for this variant
+        const geoResult = await geocodeGeoNames(variant);
+        if (geoResult) {
+            console.log(`✅ GeoNames matched "${variant}": ${geoResult.display} (${geoResult.lat}, ${geoResult.lon})`);
+            return { ...geoResult, matchedTerm: variant };
+        }
+
+        // Then Nominatim for the same variant
+        const nomResult = await geocodeNominatim(variant);
+        if (nomResult) {
+            console.log(`✅ Nominatim matched "${variant}": ${nomResult.display} (${nomResult.lat}, ${nomResult.lon})`);
+            return { ...nomResult, matchedTerm: variant };
+        }
     }
-    console.warn('GeoNames returned no Kenya result — falling back to Nominatim');
 
-    // 2. Fallback to Nominatim
-    const nomResult = await geocodeNominatim(locality);
-    if (nomResult) {
-        console.log(`✅ Nominatim: ${nomResult.display} (${nomResult.lat}, ${nomResult.lon})`);
-        return nomResult;
-    }
-
-    console.warn(`❌ Both GeoNames and Nominatim failed for: "${locality}"`);
+    console.warn(`❌ No geocoder matched any variant of: "${locality}"`);
     return null;
 }
 
@@ -780,7 +928,9 @@ function showResults(extracted, coords, calcMGRS, method, originalLocality) {
     }
 
     if (coords) {
-        document.getElementById('rLatLon').innerText   = `${coords.lat.toFixed(6)}°, ${coords.lon.toFixed(6)}° (via ${coords.source || 'geocoder'})`;
+        const termNote = coords.matchedTerm && coords.matchedTerm !== (originalLocality || extracted.locality)
+            ? ` — matched via "${coords.matchedTerm}"` : '';
+        document.getElementById('rLatLon').innerText   = `${coords.lat.toFixed(6)}°, ${coords.lon.toFixed(6)}° (via ${coords.source || 'geocoder'}${termNote})`;
         document.getElementById('rCalcMGRS').innerText = calcMGRS.full;
     } else {
         document.getElementById('rLatLon').innerText   = 'Not resolved';
@@ -908,21 +1058,29 @@ async function processFile(file) {
         }
     }
 
-    // ── Step 3: Spell-check locality ──────────────────────────────────────────
+    // ── Step 3: Spell-check + geocode locality ──────────────────────────────────
+    // spellCheckLocality tries the ORIGINAL locality first (verified via GeoNames/
+    // Nominatim) before ever accepting an LLM spelling suggestion, and only
+    // accepts a suggested correction if THAT also resolves to a real place.
     setStep('step-spell', 'active');
     const originalLocality = extracted.locality;
+    let coords = null;
+
     if (extracted.locality) {
-        extracted.locality = await spellCheckLocality(extracted.locality);
+        const result = await spellCheckLocality(extracted.locality);
+        extracted.locality = result.corrected;
+        coords = result.coords; // may already be resolved from the spell-check verification
         if (extracted.locality !== originalLocality) {
             console.log(`Locality corrected: "${originalLocality}" → "${extracted.locality}"`);
         }
     }
     setStep('step-spell', 'done');
 
-    // ── Step 4: Geocode locality ───────────────────────────────────────────────
+    // ── Step 4: Geocode locality (fallback) ─────────────────────────────────────
+    // If spellCheckLocality already resolved coordinates, skip re-geocoding.
+    // Otherwise run the full geocode() pipeline as a last attempt.
     setStep('step-geocode', 'active');
-    let coords = null;
-    if (extracted.locality) {
+    if (!coords && extracted.locality) {
         try {
             coords = await geocode(extracted.locality);
         } catch(e) { console.warn('Geocoding failed:', e); }
