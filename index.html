@@ -367,6 +367,10 @@
                     <div class="step-dot"></div>
                     <span>OCR fallback (Tesseract)</span>
                 </div>
+                <div class="progress-step" id="step-spell">
+                    <div class="step-dot"></div>
+                    <span>Spell-checking locality name</span>
+                </div>
                 <div class="progress-step" id="step-geocode">
                     <div class="step-dot"></div>
                     <span>Geocoding locality name</span>
@@ -404,8 +408,12 @@
                         <div class="field-val" id="rMGRS">—</div>
                     </div>
                     <div class="field-row">
-                        <div class="field-key">Locality</div>
+                        <div class="field-key">Locality (raw)</div>
                         <div class="field-val" id="rLocality">—</div>
+                    </div>
+                    <div class="field-row" id="rowLocalityCorrected" style="display:none">
+                        <div class="field-key">Locality (corrected)</div>
+                        <div class="field-val" id="rLocalityCorrected" style="color:#2a6e3e">—</div>
                     </div>
                     <div class="field-row">
                         <div class="field-key">Collector</div>
@@ -418,6 +426,10 @@
                     <div class="field-row">
                         <div class="field-key">Extraction via</div>
                         <div class="field-val" id="rMethod">—</div>
+                    </div>
+                    <div class="field-row">
+                        <div class="field-key">Geocoded via</div>
+                        <div class="field-val" id="rGeoSource">—</div>
                     </div>
                 </div>
             </div>
@@ -453,7 +465,7 @@
 
 <script>
 // ─── Config ───────────────────────────────────────────────────────────────────
-const BACKEND_URL = 'https://mgrs-validator-backend.onrender.com/api/chat';;
+const BACKEND_URL = 'http://localhost:5000/api/chat';
 const VISION_MODEL = 'qwen3-vl-plus';   // vision-capable
 const TEXT_MODEL   = 'qwen-plus';        // text-only fallback
 
@@ -506,6 +518,34 @@ const MGRS = {
         if (!str) return null;
         const m = str.toUpperCase().replace(/\s+/g,'').match(/(\d{1,2})([C-XY])([A-HJ-NP-Z]{2})/);
         return m ? m[3] : null;
+    },
+
+    // Returns { zone, band, square } from an MGRS string
+    parsePrefix(str) {
+        if (!str) return null;
+        const m = str.toUpperCase().replace(/\s+/g,'').match(/^(\d{1,2})([C-XY])([A-HJ-NP-Z]{2})/);
+        if (!m) return null;
+        return { zone: m[1], band: m[2], square: m[3] };
+    },
+
+    // Extracts the numeric easting/northing digits from a recorded MGRS string
+    parseNumerics(str) {
+        if (!str) return null;
+        const clean = str.toUpperCase().replace(/\s+/g,'');
+        const m = clean.match(/\d{1,2}[C-XY][A-HJ-NP-Z]{2}(\d+)/);
+        if (!m) return null;
+        const digits = m[1];
+        // digits should be even length (e.g. 8 digits = 4E+4N, 10 = 5E+5N)
+        const half = Math.floor(digits.length / 2);
+        return { easting: digits.slice(0, half), northing: digits.slice(half) };
+    },
+
+    // Builds a corrected MGRS: takes the calculated zone/band/square
+    // but keeps the RECORDED easting/northing digits unchanged
+    correctMGRS(recordedStr, calcZone, calcBand, calcSquare) {
+        const nums = this.parseNumerics(recordedStr);
+        if (!nums) return null;
+        return `${calcZone}${calcBand} ${calcSquare} ${nums.easting} ${nums.northing}`;
     }
 };
 
@@ -520,6 +560,34 @@ async function callAPI(model, messages) {
     const data = await res.json();
     return data.choices[0].message.content;
 }
+
+async function spellCheckLocality(locality) {
+    if (!locality) return locality;
+    const prompt = `You are a Kenyan geography expert. The following locality string was extracted from a herbarium specimen label and may contain spelling errors in place names.
+
+Locality: "${locality}"
+
+Your task:
+1. Identify any misspelled Kenyan place names (towns, hills, roads, areas, forests, rivers).
+2. Correct only the spelling of place names — do not rephrase, reorder, or remove any other text.
+3. Common Kenyan spelling errors to watch for: Nong→Ngong, Naivasha variants, Limuru variants, diacritics dropped from Maasai names, etc.
+4. If no spelling errors are found, return the original string unchanged.
+
+Return ONLY the corrected locality string, no explanation, no quotes.`;
+
+    try {
+        const corrected = await callAPI(TEXT_MODEL, [
+            { role: 'system', content: 'You are a Kenyan geography expert. Return only the corrected locality string.' },
+            { role: 'user', content: prompt }
+        ]);
+        const cleaned = corrected.trim().replace(/^["']|["']$/g, '');
+        return cleaned || locality;
+    } catch(e) {
+        console.warn('Spell-check failed, using original locality:', e);
+        return locality;
+    }
+}
+
 
 async function visionExtract(base64, mimeType) {
     const prompt = `You are a botanical data extraction assistant specialising in Kenyan herbarium specimens. Examine this herbarium specimen label carefully.
@@ -578,7 +646,11 @@ ${ocrText}`;
     return JSON.parse(match ? match[0] : '{}');
 }
 
-// Kenya bounding box: lat -4.7 to 5.0, lon 33.9 to 41.9
+// ─── Geocoding config ─────────────────────────────────────────────────────────
+
+const GEONAMES_USER = 'davy254';
+
+// Kenya bounding box (WGS84)
 const KENYA_BOUNDS = { minLat: -4.7, maxLat: 5.0, minLon: 33.9, maxLon: 41.9 };
 
 function isInKenya(lat, lon) {
@@ -586,32 +658,99 @@ function isInKenya(lat, lon) {
            lon >= KENYA_BOUNDS.minLon && lon <= KENYA_BOUNDS.maxLon;
 }
 
-async function geocode(locality) {
-    // Try Kenya-constrained search first using countrycodes and viewbox
-    const kenyaViewbox = '33.9,-4.7,41.9,5.0'; // minLon,minLat,maxLon,maxLat
+// ── Strategy 1: GeoNames ──────────────────────────────────────────────────────
+// GeoNames has deep coverage of small Kenyan localities, villages, hills,
+// forests and rivers sourced from NGA/NIMA gazetteers — often finds places
+// that Nominatim misses entirely.
+async function geocodeGeoNames(locality) {
+    // Try two GeoNames endpoints:
+    // (a) searchJSON — full-text search, country-restricted to Kenya
+    // (b) searchJSON with fuzzy matching (name_startsWith) for partial names
+    const endpoints = [
+        `https://secure.geonames.org/searchJSON?q=${encodeURIComponent(locality)}&country=KE&maxRows=5&lang=en&username=${GEONAMES_USER}`,
+        `https://secure.geonames.org/searchJSON?name=${encodeURIComponent(locality)}&country=KE&maxRows=5&lang=en&username=${GEONAMES_USER}`,
+        `https://secure.geonames.org/searchJSON?name_startsWith=${encodeURIComponent(locality)}&country=KE&maxRows=5&lang=en&username=${GEONAMES_USER}`
+    ];
+
+    for (const url of endpoints) {
+        try {
+            const res  = await fetch(url);
+            const data = await res.json();
+            if (data.geonames && data.geonames.length > 0) {
+                for (const place of data.geonames) {
+                    const lat = parseFloat(place.lat);
+                    const lon = parseFloat(place.lng);
+                    if (isInKenya(lat, lon)) {
+                        return {
+                            lat,
+                            lon,
+                            display: place.name + (place.adminName1 ? ', ' + place.adminName1 : '') + ', Kenya',
+                            source: 'GeoNames'
+                        };
+                    }
+                }
+            }
+        } catch(e) { console.warn('GeoNames query failed:', e); }
+    }
+    return null;
+}
+
+// ── Strategy 2: Nominatim (OpenStreetMap) ─────────────────────────────────────
+// Good for towns, roads, parks and OSM-mapped features. Used as fallback when
+// GeoNames cannot find the locality.
+async function geocodeNominatim(locality) {
+    const kenyaViewbox = '33.9,-4.7,41.9,5.0';
     const queries = [
-        // 1. Strict Kenya country code search
+        // Strict Kenya country code
         `https://nominatim.openstreetmap.org/search?format=json&q=${encodeURIComponent(locality + ', Kenya')}&countrycodes=ke&limit=3`,
-        // 2. Viewbox-bounded search (catches places Nominatim might not tag as KE)
+        // Viewbox-bounded (catches places not tagged as KE in OSM)
         `https://nominatim.openstreetmap.org/search?format=json&q=${encodeURIComponent(locality)}&viewbox=${kenyaViewbox}&bounded=1&limit=3`,
-        // 3. Unbounded fallback — accepted only if result falls within Kenya bbox
+        // Unbounded — accepted only if coordinates fall within Kenya bbox
         `https://nominatim.openstreetmap.org/search?format=json&q=${encodeURIComponent(locality)}&limit=5`
     ];
 
-    for (let i = 0; i < queries.length; i++) {
+    for (const url of queries) {
         try {
-            const res = await fetch(queries[i], { headers: { 'Accept-Language': 'en' } });
+            const res  = await fetch(url, { headers: { 'Accept-Language': 'en' } });
             const data = await res.json();
             for (const item of data) {
                 const lat = parseFloat(item.lat);
                 const lon = parseFloat(item.lon);
                 if (isInKenya(lat, lon)) {
-                    return { lat, lon, display: item.display_name };
+                    return {
+                        lat,
+                        lon,
+                        display: item.display_name,
+                        source: 'Nominatim'
+                    };
                 }
             }
-        } catch(e) { console.warn(`Geocode query ${i+1} failed:`, e); }
+        } catch(e) { console.warn('Nominatim query failed:', e); }
     }
-    return null; // no Kenya result found
+    return null;
+}
+
+// ── Main geocode: GeoNames → Nominatim ───────────────────────────────────────
+async function geocode(locality) {
+    console.log(`Geocoding: "${locality}"`);
+
+    // 1. Try GeoNames first
+    const geoResult = await geocodeGeoNames(locality);
+    if (geoResult) {
+        console.log(`✅ GeoNames: ${geoResult.display} (${geoResult.lat}, ${geoResult.lon})`);
+        return geoResult;
+    }
+    console.warn('GeoNames returned no Kenya result — falling back to Nominatim');
+
+    // 2. Fallback to Nominatim
+    const nomResult = await geocodeNominatim(locality);
+    if (nomResult) {
+        console.log(`✅ Nominatim: ${nomResult.display} (${nomResult.lat}, ${nomResult.lon})`);
+        return nomResult;
+    }
+
+    console.warn(`❌ Both GeoNames and Nominatim failed for: "${locality}"`);
+    return null;
 }
 
 // ─── UI helpers ───────────────────────────────────────────────────────────────
@@ -620,20 +759,28 @@ function setStep(id, state) {
     el.className = 'progress-step ' + state;
 }
 
-function showResults(extracted, coords, calcMGRS, method) {
+function showResults(extracted, coords, calcMGRS, method, originalLocality) {
     document.getElementById('emptyState').style.display = 'none';
     document.getElementById('resultsAll').classList.add('visible');
 
-    const val = (v) => v || '<span class="muted">not found</span>';
     document.getElementById('rSpecies').innerHTML   = extracted.species_name   || '<span style="color:#8a9a8a;font-style:italic;font-family:Inter,sans-serif">not found</span>';
     document.getElementById('rMGRS').innerText      = extracted.mgrs_coordinates || '—';
-    document.getElementById('rLocality').innerText  = extracted.locality || '—';
+    document.getElementById('rLocality').innerText  = originalLocality || extracted.locality || '—';
     document.getElementById('rCollector').innerText = extracted.collector || '—';
     document.getElementById('rDate').innerText      = extracted.collection_date || '—';
     document.getElementById('rMethod').innerText    = method;
+    document.getElementById('rGeoSource').innerText = coords ? coords.source : '—';
+
+    // Show corrected locality row only if it actually changed
+    if (extracted.locality && originalLocality && extracted.locality !== originalLocality) {
+        document.getElementById('rLocalityCorrected').innerText = extracted.locality;
+        document.getElementById('rowLocalityCorrected').style.display = 'grid';
+    } else {
+        document.getElementById('rowLocalityCorrected').style.display = 'none';
+    }
 
     if (coords) {
-        document.getElementById('rLatLon').innerText   = `${coords.lat.toFixed(6)}°, ${coords.lon.toFixed(6)}°`;
+        document.getElementById('rLatLon').innerText   = `${coords.lat.toFixed(6)}°, ${coords.lon.toFixed(6)}° (via ${coords.source || 'geocoder'})`;
         document.getElementById('rCalcMGRS').innerText = calcMGRS.full;
     } else {
         document.getElementById('rLatLon').innerText   = 'Not resolved';
@@ -662,15 +809,52 @@ function showResults(extracted, coords, calcMGRS, method) {
         finalMGRS = extracted.mgrs_coordinates;
         finalNote = 'recorded MGRS used — locality unresolved';
     } else {
-        const recSq  = MGRS.parse100km(extracted.mgrs_coordinates);
-        const calcSq = calcMGRS.square;
-        if (recSq === calcSq) {
-            vCard.innerHTML = `<div class="validation-card pass"><div class="validation-title">Validation passed</div><div class="validation-body">100 km square matches: <strong>${recSq}</strong>. Recorded MGRS is consistent with the locality.</div></div>`;
+        const recPrefix  = MGRS.parsePrefix(extracted.mgrs_coordinates);
+        const calcPrefix = MGRS.parsePrefix(calcMGRS.full);
+
+        if (!recPrefix) {
+            vCard.innerHTML = `<div class="validation-card fail"><div class="validation-title">Could not parse recorded MGRS</div><div class="validation-body">The recorded value <strong>${extracted.mgrs_coordinates}</strong> does not appear to be a valid MGRS string.</div></div>`;
+            finalNote = 'recorded MGRS unparseable';
+        } else if (recPrefix.zone === calcPrefix.zone &&
+                   recPrefix.band === calcPrefix.band &&
+                   recPrefix.square === calcPrefix.square) {
+            // Zone, band and 100km square all match — recorded MGRS is correct
+            vCard.innerHTML = `<div class="validation-card pass">
+                <div class="validation-title">Validation passed</div>
+                <div class="validation-body">
+                    Grid zone designator <strong>${recPrefix.zone}${recPrefix.band}</strong> and
+                    100 km square <strong>${recPrefix.square}</strong> both match the calculated position.
+                    Recorded MGRS is consistent with the locality.
+                </div>
+            </div>`;
             finalMGRS = extracted.mgrs_coordinates;
             finalNote = 'recorded MGRS validated against locality';
         } else {
-            vCard.innerHTML = `<div class="validation-card fail"><div class="validation-title">100 km square mismatch</div><div class="validation-body">Recorded square <strong>${recSq}</strong> does not match calculated square <strong>${calcSq}</strong>. Using corrected MGRS derived from locality.</div></div>`;
-            finalNote = 'corrected — recorded square was wrong';
+            // Mismatch — build corrected MGRS: calculated zone/band/square + recorded numerics
+            const corrected = MGRS.correctMGRS(
+                extracted.mgrs_coordinates,
+                calcPrefix.zone, calcPrefix.band, calcPrefix.square
+            );
+            finalMGRS = corrected || calcMGRS.full;
+
+            const zoneMatch   = recPrefix.zone   === calcPrefix.zone;
+            const bandMatch   = recPrefix.band   === calcPrefix.band;
+            const squareMatch = recPrefix.square === calcPrefix.square;
+
+            let mismatchDetail = [];
+            if (!zoneMatch)   mismatchDetail.push(`Zone: recorded <strong>${recPrefix.zone}</strong> vs calculated <strong>${calcPrefix.zone}</strong>`);
+            if (!bandMatch)   mismatchDetail.push(`Band: recorded <strong>${recPrefix.band}</strong> vs calculated <strong>${calcPrefix.band}</strong>`);
+            if (!squareMatch) mismatchDetail.push(`100 km square: recorded <strong>${recPrefix.square}</strong> vs calculated <strong>${calcPrefix.square}</strong>`);
+
+            vCard.innerHTML = `<div class="validation-card fail">
+                <div class="validation-title">Grid prefix mismatch</div>
+                <div class="validation-body">
+                    ${mismatchDetail.join('<br>')}.<br><br>
+                    The numeric easting/northing digits from the recorded MGRS have been preserved.
+                    Only the grid zone designator and 100 km square have been corrected.
+                </div>
+            </div>`;
+            finalNote = `corrected prefix ${recPrefix.zone}${recPrefix.band} ${recPrefix.square} → ${calcPrefix.zone}${calcPrefix.band} ${calcPrefix.square} · numerics preserved`;
         }
     }
 
@@ -685,7 +869,7 @@ async function processFile(file) {
     document.getElementById('progressWrap').style.display = 'block';
     document.getElementById('emptyState').style.display   = 'none';
     document.getElementById('resultsAll').classList.remove('visible');
-    ['step-vision','step-ocr','step-geocode','step-convert','step-validate'].forEach(s => setStep(s,''));
+    ['step-vision','step-ocr','step-spell','step-geocode','step-convert','step-validate'].forEach(s => setStep(s,''));
 
     let extracted = null;
     let method = '';
@@ -724,7 +908,18 @@ async function processFile(file) {
         }
     }
 
-    // ── Step 3: Geocode locality ───────────────────────────────────────────────
+    // ── Step 3: Spell-check locality ──────────────────────────────────────────
+    setStep('step-spell', 'active');
+    const originalLocality = extracted.locality;
+    if (extracted.locality) {
+        extracted.locality = await spellCheckLocality(extracted.locality);
+        if (extracted.locality !== originalLocality) {
+            console.log(`Locality corrected: "${originalLocality}" → "${extracted.locality}"`);
+        }
+    }
+    setStep('step-spell', 'done');
+
+    // ── Step 4: Geocode locality ───────────────────────────────────────────────
     setStep('step-geocode', 'active');
     let coords = null;
     if (extracted.locality) {
@@ -734,7 +929,7 @@ async function processFile(file) {
     }
     setStep('step-geocode', coords ? 'done' : '');
 
-    // ── Step 4: Convert to MGRS ───────────────────────────────────────────────
+    // ── Step 5: Convert to MGRS ───────────────────────────────────────────────
     setStep('step-convert', 'active');
     let calcMGRS = null;
     if (coords) {
@@ -747,7 +942,7 @@ async function processFile(file) {
     setTimeout(() => {
         setStep('step-validate', 'done');
         document.getElementById('progressWrap').style.display = 'none';
-        showResults(extracted, coords, calcMGRS, method);
+        showResults(extracted, coords, calcMGRS, method, originalLocality);
     }, 300);
 }
 
@@ -796,7 +991,10 @@ document.getElementById('testBtn').addEventListener('click', async () => {
         label.innerText = 'Backend connected · ' + BACKEND_URL;
     } catch(e) {
         dot.className = 'status-dot error';
-        label.innerText = 'Connection failed — is python backend.py running?';
+        const msg = e.message.includes('Failed to fetch')
+            ? 'Cannot reach backend — Render may be waking up (wait 30s and retry)'
+            : `Connection failed: ${e.message}`;
+        label.innerText = msg;
     }
 });
 </script>
