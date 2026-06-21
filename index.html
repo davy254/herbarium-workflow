@@ -469,6 +469,66 @@ const BACKEND_URL = 'https://mgrs-validator-backend.onrender.com/api/chat';
 const VISION_MODEL = 'qwen3-vl-plus';   // vision-capable
 const TEXT_MODEL   = 'qwen-plus';        // text-only fallback
 
+// ─── Geocode activity log ──────────────────────────────────────────────────────
+// Accumulates a structured trail for the CURRENT specimen being processed:
+// every name variant searched, what was actually used, any spelling change,
+// the lat/lon that was derived, and the MGRS calculated from it. Reset at the
+// start of each processFile() run, then dumped to console.log/console.table
+// once geocoding settles (see finalizeGeocodeLog()).
+let geocodeLog = null;
+
+function resetGeocodeLog(rawLocality) {
+    geocodeLog = {
+        rawLocality: rawLocality || null,       // locality exactly as extracted, before any correction
+        spellingSuggested: null,                // what the LLM proposed (null if never asked)
+        spellingChanged: false,                 // true only if a different, verified spelling was actually adopted
+        finalLocalityUsed: null,                // the locality string that ultimately produced a geocode hit
+        searchAttempts: [],                     // [{ term, source, endpoint, result: 'hit'|'miss', lat, lon, matchedName }]
+        geocodeSource: null,                    // 'GeoNames' | 'Nominatim' | null
+        matchedTerm: null,                      // which variant string actually resolved
+        lat: null,
+        lon: null,
+        mgrs: null,                             // MGRS string derived from lat/lon
+    };
+}
+
+function logSearchAttempt(term, source, result, extra = {}) {
+    if (!geocodeLog) return;
+    geocodeLog.searchAttempts.push({ term, source, result, ...extra });
+}
+
+function finalizeGeocodeLog() {
+    if (!geocodeLog) return;
+    const namesSearched = geocodeLog.searchAttempts.map(a => a.term);
+    const uniqueNamesSearched = [...new Set(namesSearched)];
+
+    console.log('%c── Geocode activity log ──────────────────────────', 'color:#3d9e5e;font-weight:bold');
+    console.log('Locality as extracted from label:', geocodeLog.rawLocality);
+    if (geocodeLog.spellingSuggested !== null) {
+        console.log('LLM spelling suggestion:', geocodeLog.spellingSuggested);
+    }
+    console.log('Spelling changed?', geocodeLog.spellingChanged
+        ? `YES — "${geocodeLog.rawLocality}" → "${geocodeLog.finalLocalityUsed}"`
+        : 'NO — original locality kept');
+    console.log('Locality name actually used for geocoding:', geocodeLog.finalLocalityUsed || '(none resolved)');
+    console.log('All name variants searched (in order tried):', uniqueNamesSearched);
+    console.table(geocodeLog.searchAttempts.map(a => ({
+        'search term': a.term,
+        source: a.source,
+        result: a.result,
+        lat: a.lat ?? '',
+        lon: a.lon ?? '',
+        'matched name': a.matchedName ?? ''
+    })));
+    if (geocodeLog.lat !== null) {
+        console.log(`Derived lat/lon: ${geocodeLog.lat}, ${geocodeLog.lon}  (via ${geocodeLog.geocodeSource}, matched term: "${geocodeLog.matchedTerm}")`);
+    } else {
+        console.log('Derived lat/lon: none — no variant resolved to a location in Kenya');
+    }
+    console.log('MGRS derived from lat/lon:', geocodeLog.mgrs || '(not calculated — no coordinates)');
+    console.log('%c───────────────────────────────────────────────────', 'color:#3d9e5e;font-weight:bold');
+}
+
 // ─── MGRS Converter ───────────────────────────────────────────────────────────
 const MGRS = {
     degToRad(d) { return d * Math.PI / 180; },
@@ -593,9 +653,11 @@ Return ONLY the (possibly corrected) locality string, no explanation, no quotes.
             { role: 'user', content: prompt }
         ]);
         const cleaned = corrected.trim().replace(/^["']|["']$/g, '');
+        if (geocodeLog) geocodeLog.spellingSuggested = cleaned || locality;
         return cleaned || locality;
     } catch(e) {
         console.warn('Spelling suggestion failed, using original locality:', e);
+        if (geocodeLog) geocodeLog.spellingSuggested = locality;
         return locality;
     }
 }
@@ -626,6 +688,10 @@ async function spellCheckLocality(locality) {
     const originalMatch = await verifyLocalityResolves(locality);
     if (originalMatch) {
         console.log(`Original locality "${locality}" resolved directly — no correction needed`);
+        if (geocodeLog) {
+            geocodeLog.finalLocalityUsed = locality;
+            geocodeLog.spellingChanged = false;
+        }
         return { corrected: locality, coords: originalMatch };
     }
 
@@ -642,6 +708,10 @@ async function spellCheckLocality(locality) {
     const suggestionMatch = await verifyLocalityResolves(suggestion);
     if (suggestionMatch) {
         console.log(`Locality corrected: "${locality}" → "${suggestion}" (verified via ${suggestionMatch.source})`);
+        if (geocodeLog) {
+            geocodeLog.finalLocalityUsed = suggestion;
+            geocodeLog.spellingChanged = true;
+        }
         return { corrected: suggestion, coords: suggestionMatch };
     }
 
@@ -758,13 +828,13 @@ async function geocodeGeoNames(locality) {
     // (d) name_startsWith — prefix match, catches truncated reads
     const base = `https://secure.geonames.org/searchJSON?country=KE&maxRows=5&lang=en&username=${GEONAMES_USER}`;
     const endpoints = [
-        { url: `${base}&q=${encodeURIComponent(locality)}`, requireSimilar: false },
-        { url: `${base}&name=${encodeURIComponent(locality)}`, requireSimilar: false },
-        { url: `${base}&name=${encodeURIComponent(locality)}&fuzzy=0.6`, requireSimilar: true },
-        { url: `${base}&name_startsWith=${encodeURIComponent(locality)}`, requireSimilar: true }
+        { label: 'q (full-text)',      url: `${base}&q=${encodeURIComponent(locality)}`, requireSimilar: false },
+        { label: 'name (exact field)', url: `${base}&name=${encodeURIComponent(locality)}`, requireSimilar: false },
+        { label: 'name fuzzy=0.6',     url: `${base}&name=${encodeURIComponent(locality)}&fuzzy=0.6`, requireSimilar: true },
+        { label: 'name_startsWith',    url: `${base}&name_startsWith=${encodeURIComponent(locality)}`, requireSimilar: true }
     ];
 
-    for (const { url, requireSimilar } of endpoints) {
+    for (const { label, url, requireSimilar } of endpoints) {
         try {
             const res  = await fetch(url);
             const data = await res.json();
@@ -777,6 +847,9 @@ async function geocodeGeoNames(locality) {
                     // resemble the query — prevents accepting an unrelated place
                     // just because it happened to rank first.
                     if (requireSimilar && !isPlausibleMatch(locality, place.name)) continue;
+                    logSearchAttempt(locality, 'GeoNames', 'hit', {
+                        endpoint: label, lat, lon, matchedName: place.name
+                    });
                     return {
                         lat,
                         lon,
@@ -788,6 +861,7 @@ async function geocodeGeoNames(locality) {
             }
         } catch(e) { console.warn('GeoNames query failed:', e); }
     }
+    logSearchAttempt(locality, 'GeoNames', 'miss', {});
     return null;
 }
 
@@ -798,14 +872,14 @@ async function geocodeNominatim(locality) {
     const kenyaViewbox = '33.9,-4.7,41.9,5.0';
     const queries = [
         // Strict Kenya country code
-        `https://nominatim.openstreetmap.org/search?format=json&q=${encodeURIComponent(locality + ', Kenya')}&countrycodes=ke&limit=3`,
+        { label: 'countrycodes=ke', url: `https://nominatim.openstreetmap.org/search?format=json&q=${encodeURIComponent(locality + ', Kenya')}&countrycodes=ke&limit=3` },
         // Viewbox-bounded (catches places not tagged as KE in OSM)
-        `https://nominatim.openstreetmap.org/search?format=json&q=${encodeURIComponent(locality)}&viewbox=${kenyaViewbox}&bounded=1&limit=3`,
+        { label: 'viewbox bounded',  url: `https://nominatim.openstreetmap.org/search?format=json&q=${encodeURIComponent(locality)}&viewbox=${kenyaViewbox}&bounded=1&limit=3` },
         // Unbounded — accepted only if coordinates fall within Kenya bbox
-        `https://nominatim.openstreetmap.org/search?format=json&q=${encodeURIComponent(locality)}&limit=5`
+        { label: 'unbounded',        url: `https://nominatim.openstreetmap.org/search?format=json&q=${encodeURIComponent(locality)}&limit=5` }
     ];
 
-    for (const url of queries) {
+    for (const { label, url } of queries) {
         try {
             const res  = await fetch(url, { headers: { 'Accept-Language': 'en' } });
             const data = await res.json();
@@ -813,6 +887,9 @@ async function geocodeNominatim(locality) {
                 const lat = parseFloat(item.lat);
                 const lon = parseFloat(item.lon);
                 if (isInKenya(lat, lon)) {
+                    logSearchAttempt(locality, 'Nominatim', 'hit', {
+                        endpoint: label, lat, lon, matchedName: item.display_name
+                    });
                     return {
                         lat,
                         lon,
@@ -823,6 +900,7 @@ async function geocodeNominatim(locality) {
             }
         } catch(e) { console.warn('Nominatim query failed:', e); }
     }
+    logSearchAttempt(locality, 'Nominatim', 'miss', {});
     return null;
 }
 
@@ -886,6 +964,13 @@ async function geocode(locality) {
         const geoResult = await geocodeGeoNames(variant);
         if (geoResult) {
             console.log(`✅ GeoNames matched "${variant}": ${geoResult.display} (${geoResult.lat}, ${geoResult.lon})`);
+            if (geocodeLog) {
+                geocodeLog.finalLocalityUsed = geocodeLog.finalLocalityUsed || locality;
+                geocodeLog.geocodeSource = geoResult.source;
+                geocodeLog.matchedTerm = variant;
+                geocodeLog.lat = geoResult.lat;
+                geocodeLog.lon = geoResult.lon;
+            }
             return { ...geoResult, matchedTerm: variant };
         }
 
@@ -893,6 +978,13 @@ async function geocode(locality) {
         const nomResult = await geocodeNominatim(variant);
         if (nomResult) {
             console.log(`✅ Nominatim matched "${variant}": ${nomResult.display} (${nomResult.lat}, ${nomResult.lon})`);
+            if (geocodeLog) {
+                geocodeLog.finalLocalityUsed = geocodeLog.finalLocalityUsed || locality;
+                geocodeLog.geocodeSource = nomResult.source;
+                geocodeLog.matchedTerm = variant;
+                geocodeLog.lat = nomResult.lat;
+                geocodeLog.lon = nomResult.lon;
+            }
             return { ...nomResult, matchedTerm: variant };
         }
     }
@@ -1058,6 +1150,10 @@ async function processFile(file) {
         }
     }
 
+    // Reset the geocode activity log for this specimen now that we know the
+    // raw locality string that came out of extraction.
+    resetGeocodeLog(extracted.locality || null);
+
     // ── Step 3: Spell-check + geocode locality ──────────────────────────────────
     // spellCheckLocality tries the ORIGINAL locality first (verified via GeoNames/
     // Nominatim) before ever accepting an LLM spelling suggestion, and only
@@ -1072,6 +1168,13 @@ async function processFile(file) {
         coords = result.coords; // may already be resolved from the spell-check verification
         if (extracted.locality !== originalLocality) {
             console.log(`Locality corrected: "${originalLocality}" → "${extracted.locality}"`);
+        }
+        if (coords && geocodeLog) {
+            geocodeLog.finalLocalityUsed = geocodeLog.finalLocalityUsed || coords.matchedTerm || extracted.locality;
+            geocodeLog.geocodeSource = coords.source;
+            geocodeLog.matchedTerm = coords.matchedTerm || geocodeLog.matchedTerm;
+            geocodeLog.lat = coords.lat;
+            geocodeLog.lon = coords.lon;
         }
     }
     setStep('step-spell', 'done');
@@ -1092,8 +1195,14 @@ async function processFile(file) {
     let calcMGRS = null;
     if (coords) {
         calcMGRS = MGRS.fromLatLon(coords.lat, coords.lon);
+        if (geocodeLog) geocodeLog.mgrs = calcMGRS.full;
     }
     setStep('step-convert', calcMGRS ? 'done' : '');
+
+    // Print the full geocode activity trail for this specimen — list of every
+    // name searched, the name that was actually used, any spelling change,
+    // the derived lat/lon, and the MGRS calculated from it.
+    finalizeGeocodeLog();
 
     // ── Step 5: Validate ──────────────────────────────────────────────────────
     setStep('step-validate', 'active');
