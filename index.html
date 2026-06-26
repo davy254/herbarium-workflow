@@ -477,15 +477,25 @@ const TEXT_MODEL   = 'qwen-plus';        // text-only fallback
 // once geocoding settles (see finalizeGeocodeLog()).
 let geocodeLog = null;
 
-function resetGeocodeLog(rawLocality) {
+function resetGeocodeLog(rawLocality, candidates = []) {
     geocodeLog = {
-        rawLocality: rawLocality || null,       // locality exactly as extracted, before any correction
+        rawLocality: rawLocality || null,       // top (most specific) locality as extracted, before any correction
+        candidates: candidates || [],           // full ordered locality_candidates array from extraction
+        specificCandidates: [],                 // candidates with at least one non-generic word
+        genericCandidates: [],                  // candidates that are entirely bare geographic feature words
+        disambiguationHints: [],                // county/district names found on the label, used to disambiguate same-named places
         spellingSuggested: null,                // what the LLM proposed (null if never asked)
         spellingChanged: false,                 // true only if a different, verified spelling was actually adopted
         finalLocalityUsed: null,                // the locality string that ultimately produced a geocode hit
         searchAttempts: [],                     // [{ term, source, endpoint, result: 'hit'|'miss', lat, lon, matchedName }]
+        rejectedMatches: [],                    // matches found but rejected for being too far from the anchor
+        anchorUsed: null,                       // candidate string that matched a KNOWN_ANCHORS entry, if any
+        anchorLat: null,
+        anchorLon: null,
+        anchorRadiusKm: null,
         geocodeSource: null,                    // 'GeoNames' | 'Nominatim' | null
         matchedTerm: null,                      // which variant string actually resolved
+        matchTier: null,                        // 'exact-specific' | 'fuzzy-specific' | 'exact-generic' | 'fuzzy-generic'
         lat: null,
         lon: null,
         mgrs: null,                             // MGRS string derived from lat/lon
@@ -503,14 +513,29 @@ function finalizeGeocodeLog() {
     const uniqueNamesSearched = [...new Set(namesSearched)];
 
     console.log('%c── Geocode activity log ──────────────────────────', 'color:#3d9e5e;font-weight:bold');
-    console.log('Locality as extracted from label:', geocodeLog.rawLocality);
+    console.log('Locality candidates as extracted from label (specific → general):', geocodeLog.candidates);
+    if (geocodeLog.specificCandidates && geocodeLog.specificCandidates.length > 0) {
+        console.log('  → specifically-named candidates (tried first):', geocodeLog.specificCandidates);
+    }
+    if (geocodeLog.genericCandidates && geocodeLog.genericCandidates.length > 0) {
+        console.log('  → bare generic feature-word candidates (tried last):', geocodeLog.genericCandidates);
+    }
+    if (geocodeLog.disambiguationHints && geocodeLog.disambiguationHints.length > 0) {
+        console.log('  → disambiguation hints (county/district names on label):', geocodeLog.disambiguationHints);
+    }
     if (geocodeLog.spellingSuggested !== null) {
         console.log('LLM spelling suggestion:', geocodeLog.spellingSuggested);
     }
     console.log('Spelling changed?', geocodeLog.spellingChanged
         ? `YES — "${geocodeLog.rawLocality}" → "${geocodeLog.finalLocalityUsed}"`
         : 'NO — original locality kept');
+    if (geocodeLog.anchorUsed) {
+        console.log(`Known landmark anchor used: "${geocodeLog.anchorUsed}" (${geocodeLog.anchorLat}, ${geocodeLog.anchorLon}), max radius ${geocodeLog.anchorRadiusKm}km`);
+    } else {
+        console.log('Known landmark anchor used: none — no distance sanity check applied');
+    }
     console.log('Locality name actually used for geocoding:', geocodeLog.finalLocalityUsed || '(none resolved)');
+    console.log('Match tier:', geocodeLog.matchTier || '—');
     console.log('All name variants searched (in order tried):', uniqueNamesSearched);
     console.table(geocodeLog.searchAttempts.map(a => ({
         'search term': a.term,
@@ -520,10 +545,14 @@ function finalizeGeocodeLog() {
         lon: a.lon ?? '',
         'matched name': a.matchedName ?? ''
     })));
+    if (geocodeLog.rejectedMatches.length > 0) {
+        console.warn('Matches rejected for being too far from the anchor:');
+        console.table(geocodeLog.rejectedMatches);
+    }
     if (geocodeLog.lat !== null) {
         console.log(`Derived lat/lon: ${geocodeLog.lat}, ${geocodeLog.lon}  (via ${geocodeLog.geocodeSource}, matched term: "${geocodeLog.matchedTerm}")`);
     } else {
-        console.log('Derived lat/lon: none — no variant resolved to a location in Kenya');
+        console.log('Derived lat/lon: none — no candidate resolved to a location in Kenya within tolerance');
     }
     console.log('MGRS derived from lat/lon:', geocodeLog.mgrs || '(not calculated — no coordinates)');
     console.log('%c───────────────────────────────────────────────────', 'color:#3d9e5e;font-weight:bold');
@@ -730,15 +759,20 @@ Extract and return ONLY valid JSON with these fields:
 {
   "species_name": "full scientific name or null",
   "mgrs_coordinates": "MGRS string exactly as written on the label, or null if not present",
-  "locality": "the most specific place name you can find — town, village, area, hill, river, forest, or administrative location within Kenya. Extract just the place name(s), not a full sentence. If multiple place names appear, pick the most specific one. Return null only if no place name is visible.",
+  "locality_candidates": ["ordered array of every place name mentioned on the label, MOST SPECIFIC FIRST, MOST GENERAL LAST"],
   "collection_date": "date as written or null",
   "collector": "collector name(s) or null"
 }
 
 IMPORTANT RULES:
-- For locality: prefer specific Kenyan place names (e.g. 'Karura Forest', 'Thika', 'Mt Kenya', 'Arabuko-Sokoke') over vague descriptions like 'near river' or 'forest edge'. If both appear, return the named place.
+- For locality_candidates: extract EVERY distinct place name on the label — not just the most specific one. Herbarium labels often mention a small feature (a peak, valley, ridge, stream) AND a larger, well-known landmark (a mountain, forest, county, or national park) in the same description. Include all of them as separate array entries.
+- Order the array from most specific (e.g. 'Gamia Peaks', 'Teleki Valley') to most general (e.g. 'Mount Kenya'). The most general, most well-known entry is often the most reliable for geocoding, even though it's listed last.
+- Use just the place name itself for each entry, not a full sentence (e.g. 'Teleki Valley' not 'near Teleki Valley below the peak').
+- NEVER include a purely descriptive phrase as its own candidate, even if it also contains a real place name within it. For example, if the label reads "small hill at the western side of Ngong hills", do NOT add "small hill at the western side of Ngong hills" as a candidate — only add the actual place name extracted from it, i.e. 'Ngong hills' (and 'Ngong'). A candidate should be a name you could look up on a map, not a description of where something is relative to a name.
+- Do not merge multiple place names into one string. "Ridge between S & Naro Moru Streams, Mount Kenya" should become separate entries like 'Naro Moru', 'Mount Kenya' — not one combined string.
+- Return an empty array only if no place name is visible anywhere on the label.
 - For mgrs_coordinates: copy the value EXACTLY as written, including any spaces or formatting. If no MGRS grid reference appears on the label, return null — do not guess or infer one.
-- If MGRS is null, the locality will be used to calculate coordinates, so accuracy of the locality field is critical.
+- If MGRS is null, locality_candidates will be geocoded to derive coordinates, so capturing every candidate (especially well-known landmarks) is critical.
 
 Return only the JSON object, no other text.`;
 
@@ -751,7 +785,7 @@ Return only the JSON object, no other text.`;
     }];
     const raw = await callAPI(VISION_MODEL, messages);
     const match = raw.match(/\{[\s\S]*\}/);
-    return JSON.parse(match ? match[0] : '{}');
+    return normalizeExtracted(JSON.parse(match ? match[0] : '{}'));
 }
 
 async function textExtract(ocrText) {
@@ -759,15 +793,20 @@ async function textExtract(ocrText) {
 {
   "species_name": "full scientific name or null",
   "mgrs_coordinates": "MGRS string exactly as written, or null if not present",
-  "locality": "most specific Kenyan place name found — town, village, area, hill, river, forest, or county. Return just the place name, not a full sentence. null only if truly absent.",
+  "locality_candidates": ["ordered array of every place name found in the text, MOST SPECIFIC FIRST, MOST GENERAL LAST"],
   "collection_date": "date as written or null",
   "collector": "collector name(s) or null"
 }
 
 IMPORTANT RULES:
-- For locality: prefer specific named Kenyan places (e.g. 'Limuru', 'Tsavo East', 'Rift Valley', 'Kakamega Forest') over vague descriptions. If multiple place names appear, return the most specific.
+- For locality_candidates: extract EVERY distinct place name in the text — not just the most specific one. Herbarium labels often mention a small feature (a peak, valley, ridge, stream) AND a larger, well-known landmark (a mountain, forest, county, or national park). Include all of them as separate array entries.
+- Order the array from most specific to most general. The most general, most well-known entry (e.g. 'Mount Kenya', 'Tsavo East') is often the most reliable for geocoding, even though it's listed last.
+- Use just the place name itself for each entry, not a full sentence.
+- NEVER include a purely descriptive phrase as its own candidate, even if it also contains a real place name within it. For example, if the text reads "small hill at the western side of Ngong hills", do NOT add "small hill at the western side of Ngong hills" as a candidate — only add the actual place name extracted from it, i.e. 'Ngong hills' (and 'Ngong'). A candidate should be a name you could look up on a map, not a description of where something is relative to a name.
+- Do not merge multiple place names into one string.
+- Return an empty array only if no place name is present anywhere in the text.
 - For mgrs_coordinates: copy EXACTLY as written. If no MGRS grid reference is present in the text, return null — do not invent one.
-- If mgrs_coordinates is null, the locality field will be geocoded to derive coordinates, so it must be as accurate as possible.
+- If mgrs_coordinates is null, locality_candidates will be geocoded to derive coordinates, so capturing every candidate (especially well-known landmarks) is critical.
 
 OCR TEXT:
 ${ocrText}`;
@@ -777,7 +816,110 @@ ${ocrText}`;
         { role: 'user', content: prompt }
     ]);
     const match = raw.match(/\{[\s\S]*\}/);
-    return JSON.parse(match ? match[0] : '{}');
+    return normalizeExtracted(JSON.parse(match ? match[0] : '{}'));
+}
+
+// Normalizes the LLM's extraction output so the rest of the pipeline can rely
+// on a consistent shape: always a `locality_candidates` array (never a bare
+// `locality` string), de-duplicated and trimmed. Keeps backward compatibility
+// in case a model still returns the older singular `locality` field.
+
+// Words that are too generic/administrative to ever be useful as a locality
+// search term or anchor candidate. These are country names, very broad
+// region words, and similar boilerplate that sometimes gets pulled out of
+// label text (e.g. a "Kenya" fragment from a country field or MGRS zone
+// annotation) but is never itself a geocodable place. Critically, allowing
+// a word like this through previously caused it to falsely match against
+// KNOWN_ANCHORS entries that merely contain it as a substring (e.g. "Kenya"
+// inside "Mount Kenya"), forming a bogus anchor that rejected genuinely
+// correct, more specific matches found elsewhere on the same label.
+const LOCALITY_STOPLIST = new Set([
+    'kenya', 'east africa', 'africa', 'republic of kenya'
+]);
+
+function isStoplistedCandidate(candidate) {
+    const norm = candidate.toLowerCase().replace(/[.,]/g, '').replace(/\s+/g, ' ').trim();
+    return LOCALITY_STOPLIST.has(norm);
+}
+
+// ── Descriptive-sentence / non-locality fragment detection ───────────────────
+// Despite explicit prompt instructions to extract only place names (not full
+// sentences), the extraction model can still occasionally return a
+// descriptive fragment like "small hill at the western side of Ngong hills"
+// alongside genuinely correct candidates like "Ngong hills" and "Ngong".
+// Sending a fragment like that to a geocoder is actively dangerous: splitting
+// it into "variants" can produce a single leading word (e.g. "small") that
+// is itself a real, unrelated place name somewhere else entirely, which then
+// wins an exact match and silently produces a wrong, confident-looking
+// result. This is a deterministic, code-level safety net — it does not rely
+// on the LLM following formatting instructions correctly.
+//
+// Common relational/descriptive words that signal "this is prose describing
+// a location" rather than "this is the location's name". A candidate
+// containing any of these as a standalone word (word-boundary matched) is
+// treated as a descriptive fragment, not a locality, UNLESS the candidate is
+// short enough that the word is plausibly part of an actual compound place
+// name (e.g. very few real Kenyan place names contain "western", but we
+// still guard with a length check rather than rejecting on word-presence
+// alone, in case of legitimate exceptions).
+const DESCRIPTIVE_FRAGMENT_WORDS = new Set([
+    'at', 'the', 'of', 'between', 'side', 'sides', 'western', 'eastern',
+    'northern', 'southern', 'small', 'large', 'big', 'near', 'on', 'in',
+    'below', 'above', 'about', 'approximately', 'situated', 'located',
+    'edge', 'foot', 'top', 'slope', 'slopes', 'area', 'region', 'part',
+    'within', 'along', 'towards', 'from', 'to', 'and', 'with'
+]);
+
+// A candidate is treated as a descriptive fragment (not a real locality) if:
+//   - it has more than 5 words (real place names are almost always 1-3
+//     words, occasionally 4 for compound names like "Ridge between Naro
+//     Moru Streams" — but a genuine 6+ word string is almost always prose), OR
+//   - it contains 2 or more of the descriptive/relational words above as
+//     standalone words. A single descriptive word might still be part of a
+//     real compound name in rare cases, but two or more is a strong signal
+//     of a full descriptive sentence rather than a name.
+function isDescriptiveFragment(candidate) {
+    const words = candidate.trim().split(/\s+/).filter(Boolean);
+    if (words.length > 5) return true;
+    const descriptiveCount = words.filter(w =>
+        DESCRIPTIVE_FRAGMENT_WORDS.has(w.toLowerCase().replace(/[.,]/g, ''))
+    ).length;
+    return descriptiveCount >= 2;
+}
+
+function normalizeExtracted(extracted) {
+    let candidates = [];
+    if (Array.isArray(extracted.locality_candidates)) {
+        candidates = extracted.locality_candidates;
+    } else if (extracted.locality_candidates) {
+        candidates = [extracted.locality_candidates];
+    } else if (extracted.locality) {
+        candidates = [extracted.locality];
+    }
+    candidates = candidates
+        .filter(c => typeof c === 'string' && c.trim().length > 0)
+        .map(c => c.trim())
+        .filter(c => !isStoplistedCandidate(c))
+        .filter(c => {
+            if (isDescriptiveFragment(c)) {
+                console.warn(`Dropping descriptive-sentence candidate (not a place name): "${c}"`);
+                return false;
+            }
+            return true;
+        });
+    // de-duplicate while preserving order
+    const seen = new Set();
+    candidates = candidates.filter(c => {
+        const k = c.toLowerCase();
+        if (seen.has(k)) return false;
+        seen.add(k);
+        return true;
+    });
+    extracted.locality_candidates = candidates;
+    // Keep `locality` populated as the top (most specific) candidate for any
+    // older code paths / UI fields that still read a singular value.
+    extracted.locality = candidates.length > 0 ? candidates[0] : null;
+    return extracted;
 }
 
 // ─── Geocoding config ─────────────────────────────────────────────────────────
@@ -790,6 +932,175 @@ const KENYA_BOUNDS = { minLat: -4.7, maxLat: 5.0, minLon: 33.9, maxLon: 41.9 };
 function isInKenya(lat, lon) {
     return lat >= KENYA_BOUNDS.minLat && lat <= KENYA_BOUNDS.maxLat &&
            lon >= KENYA_BOUNDS.minLon && lon <= KENYA_BOUNDS.maxLon;
+}
+
+// ── Administrative disambiguation hints ────────────────────────────────────────
+// Kenya's 47 counties (current devolved-government names). Older labels often
+// say "District" instead of "County" (pre-2010 administrative units), but the
+// county name itself is usually still the recognizable part (e.g. "Narok
+// District" → county "Narok"). This list is used to detect when a candidate
+// is naming an administrative area rather than a specific locality, so it can
+// be used as a DISAMBIGUATION HINT rather than a search term in its own right.
+//
+// Some Kenyan place names are genuinely ambiguous — they refer to two or more
+// distinct, unrelated real features. The clearest example is "Ewaso Nyiro"
+// (also spelled "Ewaso Ng'iro"), which names BOTH a ~700km river rising on
+// Mount Kenya and flowing through Laikipia/Samburu/Isiolo into the Lorian
+// Swamp, AND a separate, much shorter river rising in the Mau Forest and
+// flowing through Narok County into Lake Natron. A bare GeoNames/Nominatim
+// lookup for "Ewaso Nyiro" will return both (and possibly more variants), and
+// without secondary context there is no principled way to know which one a
+// given herbarium label means — but herbarium labels often DO carry that
+// context, in the form of a district/county name recorded elsewhere on the
+// same label (e.g. "Narok District"). When that's available, it should be
+// used to pick between otherwise-equally-valid results sharing the same name.
+const KENYA_COUNTIES = new Set([
+    'mombasa', 'kwale', 'kilifi', 'tana river', 'lamu', 'taita taveta',
+    'garissa', 'wajir', 'mandera', 'marsabit', 'isiolo', 'meru',
+    'tharaka-nithi', 'tharaka nithi', 'embu', 'kitui', 'machakos', 'makueni',
+    'nyandarua', 'nyeri', 'kirinyaga', "murang'a", 'muranga', 'kiambu',
+    'turkana', 'west pokot', 'samburu', 'trans-nzoia', 'trans nzoia',
+    'uasin gishu', 'elgeyo-marakwet', 'elgeyo marakwet', 'nandi', 'baringo',
+    'laikipia', 'nakuru', 'narok', 'kajiado', 'kericho', 'bomet', 'kakamega',
+    'vihiga', 'bungoma', 'busia', 'siaya', 'kisumu', 'homa bay', 'migori',
+    'kisii', 'nyamira', 'nairobi'
+]);
+
+// Strips common district/county/region suffix words and normalizes case, so
+// "Narok District" and "Narok County" both reduce to "narok" for matching
+// against KENYA_COUNTIES and against a GeoNames result's adminName1 field.
+function normalizeAdminName(s) {
+    return s.toLowerCase()
+        .replace(/\bdistrict\b/g, '')
+        .replace(/\bcounty\b/g, '')
+        .replace(/\bregion\b/g, '')
+        .replace(/[.,]/g, '')
+        .replace(/\s+/g, ' ')
+        .trim();
+}
+
+// Scans the full candidate list for anything that names a Kenyan county or
+// district (e.g. "Narok District", "Isiolo County", or a bare "Narok"), and
+// returns the normalized county names found. These are returned separately
+// from locality search terms — a district/county name on its own is too
+// broad to usefully geocode as "the" locality, but it's valuable as a
+// disambiguation hint when a DIFFERENT candidate's name is ambiguous.
+function extractDisambiguationHints(candidates) {
+    const hints = [];
+    for (const candidate of candidates) {
+        const norm = normalizeAdminName(candidate);
+        if (KENYA_COUNTIES.has(norm)) hints.push(norm);
+    }
+    return hints;
+}
+
+// ── Distance helper (Haversine, km) ───────────────────────────────────────────
+function haversineKm(lat1, lon1, lat2, lon2) {
+    const R = 6371;
+    const dLat = (lat2 - lat1) * Math.PI / 180;
+    const dLon = (lon2 - lon1) * Math.PI / 180;
+    const a = Math.sin(dLat/2)**2 +
+              Math.cos(lat1 * Math.PI/180) * Math.cos(lat2 * Math.PI/180) * Math.sin(dLon/2)**2;
+    return 2 * R * Math.asin(Math.sqrt(a));
+}
+
+// ── Known landmark anchors ────────────────────────────────────────────────────
+// Large, unambiguous, well-known Kenyan landmarks with fixed reference
+// coordinates. If a locality candidate matches one of these (by name, case-
+// insensitive, allowing minor prefix/suffix variation like "Mt" vs "Mount"),
+// we use it as a trusted geographic anchor: a sanity-check radius around
+// which any other candidate's geocoded match must fall. This catches cases
+// like a small feature name ("Gamia") fuzzy-matching an unrelated place
+// hundreds of km away from the landmark the label actually describes.
+const KNOWN_ANCHORS = [
+    { names: ['mount kenya', 'mt kenya', 'mt. kenya'], lat: -0.1521, lon: 37.3084, radiusKm: 60 },
+    { names: ['mount elgon', 'mt elgon', 'mt. elgon'], lat: 1.1349, lon: 34.5582, radiusKm: 50 },
+    { names: ['aberdare', 'aberdares', 'aberdare range'], lat: -0.4167, lon: 36.7000, radiusKm: 50 },
+    { names: ['tsavo east'], lat: -2.9667, lon: 38.7667, radiusKm: 90 },
+    { names: ['tsavo west'], lat: -3.0500, lon: 38.0000, radiusKm: 80 },
+    { names: ['masai mara', 'maasai mara'], lat: -1.5000, lon: 35.1500, radiusKm: 60 },
+    { names: ['amboseli'], lat: -2.6527, lon: 37.2606, radiusKm: 50 },
+    { names: ['lake victoria'], lat: -0.7167, lon: 34.2667, radiusKm: 90 },
+    { names: ['lake turkana'], lat: 3.5000, lon: 36.0000, radiusKm: 120 },
+    { names: ['lake naivasha'], lat: -0.7167, lon: 36.3500, radiusKm: 30 },
+    { names: ['lake nakuru'], lat: -0.3667, lon: 36.0833, radiusKm: 30 },
+    { names: ['kakamega forest'], lat: 0.2833, lon: 34.8667, radiusKm: 30 },
+    { names: ['arabuko-sokoke', 'arabuko sokoke'], lat: -3.3167, lon: 39.8667, radiusKm: 30 },
+    { names: ['nairobi'], lat: -1.2921, lon: 36.8219, radiusKm: 40 },
+    { names: ['mombasa'], lat: -4.0435, lon: 39.6682, radiusKm: 40 },
+    { names: ['kisumu'], lat: -0.0917, lon: 34.7680, radiusKm: 40 },
+    { names: ['nakuru'], lat: -0.3031, lon: 36.0800, radiusKm: 40 },
+    { names: ['eldoret'], lat: 0.5143, lon: 35.2698, radiusKm: 40 },
+    { names: ['thika'], lat: -1.0333, lon: 37.0833, radiusKm: 25 },
+    { names: ['naro moru'], lat: -0.1833, lon: 37.0167, radiusKm: 20 },
+    { names: ['rift valley'], lat: 0.0000, lon: 36.0000, radiusKm: 250 },
+];
+
+// Normalizes a candidate string for anchor matching: lowercase, strip
+// punctuation/extra whitespace.
+function normalizeForAnchorMatch(s) {
+    return s.toLowerCase().replace(/[.,]/g, '').replace(/\s+/g, ' ').trim();
+}
+
+// Escapes a string for safe use inside a RegExp.
+function escapeRegExp(s) {
+    return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+// Checks whether a normalized locality candidate genuinely refers to a known
+// anchor name `n`. Two cases are allowed:
+//   1. Exact match (norm === n) — e.g. candidate "Mount Kenya" vs anchor "mount kenya"
+//   2. The anchor name appears as a whole word/phrase WITHIN the candidate
+//      (word-boundary matched) — e.g. candidate "Mount Kenya National Park"
+//      contains the anchor phrase "mount kenya" as complete words.
+//
+// IMPORTANT: this deliberately does NOT allow the reverse direction (anchor
+// name containing the candidate as a substring). That direction is what
+// previously caused a short, generic fragment like "Kenya" to falsely match
+// the anchor "mount kenya" — since the string "kenya" is trivially a
+// substring of "mount kenya" even though the candidate never actually named
+// that landmark. A short candidate being "inside" a longer anchor name is
+// not evidence of anything; only the reverse (the full anchor phrase
+// genuinely appearing in what was extracted) is meaningful.
+function candidateMatchesAnchorName(norm, n) {
+    if (norm === n) return true;
+    const re = new RegExp(`\\b${escapeRegExp(n)}\\b`);
+    return re.test(norm);
+}
+
+// Looks through a list of locality candidates and finds every one that
+// matches a KNOWN_ANCHORS entry, then returns the match with the LARGEST
+// radius — i.e. the broadest, most general landmark found among the
+// candidates. Returns null if none of the candidates match a known landmark.
+//
+// Why largest radius and not first match: a label can legitimately mention
+// more than one recognizable landmark at once (e.g. both "Naro Moru", a
+// small town with a tight 20km radius, AND "Mount Kenya", a massif with a
+// 60km radius — Naro Moru sits on the mountain's western slopes). If the
+// smaller, tighter anchor were picked just because it appeared first in the
+// candidate list, it could end up rejecting a perfectly genuine match on the
+// larger, more authoritative landmark for being "too far" from the smaller
+// one — even though the larger one is actually the more reliable anchor and
+// was itself extracted from the same label. Preferring the broadest anchor
+// avoids one correct landmark's narrow radius vetoing another correct one.
+//
+// Candidates shorter than 4 characters (e.g. "Mt", "Ke") are skipped entirely
+// — they're too short to meaningfully confirm a landmark match and are more
+// likely to be OCR noise or stray fragments than an actual place reference.
+function findKnownAnchor(candidates) {
+    let best = null; // { candidate, anchor }
+    for (const candidate of candidates) {
+        const norm = normalizeForAnchorMatch(candidate);
+        if (norm.length < 4) continue;
+        for (const anchor of KNOWN_ANCHORS) {
+            if (anchor.names.some(n => candidateMatchesAnchorName(norm, n))) {
+                if (!best || anchor.radiusKm > best.anchor.radiusKm) {
+                    best = { candidate, anchor };
+                }
+            }
+        }
+    }
+    return best;
 }
 
 // ── Strategy 1: GeoNames ──────────────────────────────────────────────────────
@@ -813,51 +1124,98 @@ function levenshtein(a, b) {
 
 // Returns true if `candidate` is plausibly an OCR/spelling variant of `query`
 // — short edit distance relative to string length, not a totally different name.
+//
+// The budget is intentionally tight: real OCR/handwriting misreads and minor
+// spelling variants of the SAME place are almost always 1, occasionally 2,
+// character edits (e.g. "Lolgories"→"Lolgorien" is 1 edit; "Mangea"→"Mwangea"
+// is 1 edit). A looser, length-scaled budget (e.g. ~35% of length) also lets
+// through edits that land on a completely different, unrelated place that
+// merely happens to be similar length and share some letters (e.g.
+// "Machanoa"→"Machakos" is 2 edits on an 8-letter word and clears a 35%
+// budget, but Machakos is a real, different town ~150km away — not a misread
+// of "Machanoa"). Short words (≤6 chars) get only a 1-edit budget, since a
+// 2-edit budget on something that short is a large fraction of the string.
 function isPlausibleMatch(query, candidate) {
     const dist = levenshtein(query, candidate);
     const maxLen = Math.max(query.length, candidate.length);
-    return dist <= Math.max(2, Math.ceil(maxLen * 0.35)); // allow ~35% character difference
+    const budget = maxLen <= 6 ? 1 : Math.min(2, Math.floor(maxLen * 0.2));
+    return dist <= budget;
 }
 
-async function geocodeGeoNames(locality) {
+async function geocodeGeoNames(locality, allowFuzzy = true, disambiguationHints = []) {
     // Try multiple GeoNames strategies, from exact to fuzzy:
     // (a) searchJSON — full-text search, country-restricted to Kenya
     // (b) searchJSON with name= exact field match
     // (c) fuzzy=0.6 — Levenshtein-based fuzzy match, tolerates OCR noise like
     //     "Lolgories" vs "Lolgorien" (transposed/substituted letters)
     // (d) name_startsWith — prefix match, catches truncated reads
+    // When allowFuzzy is false, only (a) and (b) — the exact-style endpoints —
+    // are tried. This lets the caller run an exact pass across ALL candidates
+    // before any candidate is allowed to fuzzy-match anything, so a vague or
+    // garbled small-feature name can't "win" via fuzzy match ahead of a clean
+    // exact match on a better candidate (e.g. a well-known landmark).
+    //
+    // disambiguationHints: normalized county names (e.g. ['narok']) extracted
+    // from OTHER candidates on the same label. Some real Kenyan place names
+    // are genuinely ambiguous — most notably "Ewaso Nyiro", which names two
+    // distinct, unrelated rivers in different parts of the country. When a
+    // query returns multiple in-Kenya, name-plausible results, we don't just
+    // take the first one: if any result's adminName1 (county) matches a
+    // disambiguation hint, that result is preferred. Only if no hint matches
+    // anything do we fall back to "first result", exactly as before.
     const base = `https://secure.geonames.org/searchJSON?country=KE&maxRows=5&lang=en&username=${GEONAMES_USER}`;
-    const endpoints = [
-        { label: 'q (full-text)',      url: `${base}&q=${encodeURIComponent(locality)}`, requireSimilar: false },
-        { label: 'name (exact field)', url: `${base}&name=${encodeURIComponent(locality)}`, requireSimilar: false },
-        { label: 'name fuzzy=0.6',     url: `${base}&name=${encodeURIComponent(locality)}&fuzzy=0.6`, requireSimilar: true },
-        { label: 'name_startsWith',    url: `${base}&name_startsWith=${encodeURIComponent(locality)}`, requireSimilar: true }
+    let endpoints = [
+        { label: 'q (full-text)',      url: `${base}&q=${encodeURIComponent(locality)}`, requireSimilar: false, fuzzy: false },
+        { label: 'name (exact field)', url: `${base}&name=${encodeURIComponent(locality)}`, requireSimilar: false, fuzzy: false },
+        { label: 'name fuzzy=0.6',     url: `${base}&name=${encodeURIComponent(locality)}&fuzzy=0.6`, requireSimilar: true, fuzzy: true },
+        { label: 'name_startsWith',    url: `${base}&name_startsWith=${encodeURIComponent(locality)}`, requireSimilar: true, fuzzy: true }
     ];
+    if (!allowFuzzy) endpoints = endpoints.filter(e => !e.fuzzy);
 
     for (const { label, url, requireSimilar } of endpoints) {
         try {
             const res  = await fetch(url);
             const data = await res.json();
             if (data.geonames && data.geonames.length > 0) {
+                // Collect every candidate result that's in Kenya and (for
+                // fuzzy/prefix endpoints) plausible, before picking one —
+                // rather than returning on the very first match — so we can
+                // check ALL of them against the disambiguation hints.
+                const validResults = [];
                 for (const place of data.geonames) {
                     const lat = parseFloat(place.lat);
                     const lon = parseFloat(place.lng);
                     if (!isInKenya(lat, lon)) continue;
-                    // For fuzzy/prefix matches, require the result name to actually
-                    // resemble the query — prevents accepting an unrelated place
-                    // just because it happened to rank first.
                     if (requireSimilar && !isPlausibleMatch(locality, place.name)) continue;
-                    logSearchAttempt(locality, 'GeoNames', 'hit', {
-                        endpoint: label, lat, lon, matchedName: place.name
-                    });
-                    return {
-                        lat,
-                        lon,
-                        display: place.name + (place.adminName1 ? ', ' + place.adminName1 : '') + ', Kenya',
-                        source: 'GeoNames',
-                        matchedName: place.name
-                    };
+                    validResults.push({ place, lat, lon });
                 }
+                if (validResults.length === 0) continue;
+
+                let chosen = validResults[0];
+                let disambiguatedVia = null;
+                if (disambiguationHints.length > 0 && validResults.length > 1) {
+                    const matchByHint = validResults.find(r =>
+                        r.place.adminName1 && disambiguationHints.includes(normalizeAdminName(r.place.adminName1))
+                    );
+                    if (matchByHint) {
+                        chosen = matchByHint;
+                        disambiguatedVia = matchByHint.place.adminName1;
+                        console.log(`📌 "${locality}" matched multiple places — disambiguated to "${chosen.place.name}, ${disambiguatedVia}" using county hint from label`);
+                    }
+                }
+
+                logSearchAttempt(locality, 'GeoNames', 'hit', {
+                    endpoint: label, lat: chosen.lat, lon: chosen.lon, matchedName: chosen.place.name,
+                    ...(disambiguatedVia ? { disambiguatedVia } : {}),
+                    ...(validResults.length > 1 ? { otherCandidates: validResults.length - 1 } : {})
+                });
+                return {
+                    lat: chosen.lat,
+                    lon: chosen.lon,
+                    display: chosen.place.name + (chosen.place.adminName1 ? ', ' + chosen.place.adminName1 : '') + ', Kenya',
+                    source: 'GeoNames',
+                    matchedName: chosen.place.name
+                };
             }
         } catch(e) { console.warn('GeoNames query failed:', e); }
     }
@@ -868,36 +1226,60 @@ async function geocodeGeoNames(locality) {
 // ── Strategy 2: Nominatim (OpenStreetMap) ─────────────────────────────────────
 // Good for towns, roads, parks and OSM-mapped features. Used as fallback when
 // GeoNames cannot find the locality.
-async function geocodeNominatim(locality) {
+async function geocodeNominatim(locality, allowFuzzy = true, disambiguationHints = []) {
     const kenyaViewbox = '33.9,-4.7,41.9,5.0';
-    const queries = [
-        // Strict Kenya country code
-        { label: 'countrycodes=ke', url: `https://nominatim.openstreetmap.org/search?format=json&q=${encodeURIComponent(locality + ', Kenya')}&countrycodes=ke&limit=3` },
-        // Viewbox-bounded (catches places not tagged as KE in OSM)
-        { label: 'viewbox bounded',  url: `https://nominatim.openstreetmap.org/search?format=json&q=${encodeURIComponent(locality)}&viewbox=${kenyaViewbox}&bounded=1&limit=3` },
-        // Unbounded — accepted only if coordinates fall within Kenya bbox
-        { label: 'unbounded',        url: `https://nominatim.openstreetmap.org/search?format=json&q=${encodeURIComponent(locality)}&limit=5` }
+    let queries = [
+        // Strict Kenya country code — treated as "exact" since it's tightly scoped
+        { label: 'countrycodes=ke', url: `https://nominatim.openstreetmap.org/search?format=json&q=${encodeURIComponent(locality + ', Kenya')}&countrycodes=ke&limit=3`, fuzzy: false },
+        // Viewbox-bounded (catches places not tagged as KE in OSM) — still scoped, treated as exact
+        { label: 'viewbox bounded',  url: `https://nominatim.openstreetmap.org/search?format=json&q=${encodeURIComponent(locality)}&viewbox=${kenyaViewbox}&bounded=1&limit=3`, fuzzy: false },
+        // Unbounded — no geographic scoping at all until results are filtered by
+        // bbox after the fact, so this is the riskiest tier and counts as fuzzy.
+        { label: 'unbounded',        url: `https://nominatim.openstreetmap.org/search?format=json&q=${encodeURIComponent(locality)}&limit=5`, fuzzy: true }
     ];
+    if (!allowFuzzy) queries = queries.filter(q => !q.fuzzy);
 
     for (const { label, url } of queries) {
         try {
             const res  = await fetch(url, { headers: { 'Accept-Language': 'en' } });
             const data = await res.json();
+            const validResults = [];
             for (const item of data) {
                 const lat = parseFloat(item.lat);
                 const lon = parseFloat(item.lon);
-                if (isInKenya(lat, lon)) {
-                    logSearchAttempt(locality, 'Nominatim', 'hit', {
-                        endpoint: label, lat, lon, matchedName: item.display_name
-                    });
-                    return {
-                        lat,
-                        lon,
-                        display: item.display_name,
-                        source: 'Nominatim'
-                    };
+                if (isInKenya(lat, lon)) validResults.push({ item, lat, lon });
+            }
+            if (validResults.length === 0) continue;
+
+            // Same disambiguation logic as geocodeGeoNames: Nominatim has no
+            // separate county field, but display_name includes the region as
+            // a comma-separated component, so we check whether any hint
+            // appears anywhere in that string.
+            let chosen = validResults[0];
+            let disambiguatedVia = null;
+            if (disambiguationHints.length > 0 && validResults.length > 1) {
+                const matchByHint = validResults.find(r => {
+                    const normDisplay = normalizeAdminName(r.item.display_name || '');
+                    return disambiguationHints.some(hint => normDisplay.includes(hint));
+                });
+                if (matchByHint) {
+                    chosen = matchByHint;
+                    disambiguatedVia = chosen.item.display_name;
+                    console.log(`📌 "${locality}" matched multiple places — disambiguated to "${disambiguatedVia}" using county hint from label`);
                 }
             }
+
+            logSearchAttempt(locality, 'Nominatim', 'hit', {
+                endpoint: label, lat: chosen.lat, lon: chosen.lon, matchedName: chosen.item.display_name,
+                ...(disambiguatedVia ? { disambiguatedVia } : {}),
+                ...(validResults.length > 1 ? { otherCandidates: validResults.length - 1 } : {})
+            });
+            return {
+                lat: chosen.lat,
+                lon: chosen.lon,
+                display: chosen.item.display_name,
+                source: 'Nominatim'
+            };
         } catch(e) { console.warn('Nominatim query failed:', e); }
     }
     logSearchAttempt(locality, 'Nominatim', 'miss', {});
@@ -917,6 +1299,22 @@ function extractLocalityVariants(locality) {
         const t = s.trim().replace(/\s+/g, ' ');
         if (t && !seen.has(t.toLowerCase())) { seen.add(t.toLowerCase()); variants.push(t); }
     };
+
+    // Defensive guard: if this string is itself a descriptive sentence
+    // (e.g. "small hill at the western side of Ngong hills") rather than a
+    // place name — which should normally have been filtered out already by
+    // normalizeExtracted(), but is checked again here in case this function
+    // is ever called directly with unfiltered input — skip the bare-prefix
+    // extraction step below entirely. That step assumes its input is a short
+    // place name where "the first word" is meaningful (e.g. "Ngong" from
+    // "Ngong Hills"); applied to a sentence, it instead extracts a random
+    // leading word (e.g. "small") and sends it to the geocoder as if it were
+    // a place name, which can silently match an unrelated real place.
+    const looksDescriptive = isDescriptiveFragment(locality);
+    if (looksDescriptive) {
+        add(locality);
+        return variants;
+    }
 
     // 1. Content inside parentheses — usually the most specific named place
     //    e.g. "Lamu (Kiunga Shops)" → "Kiunga Shops"
@@ -955,42 +1353,253 @@ function extractLocalityVariants(locality) {
     return variants;
 }
 
-async function geocode(locality) {
-    const variants = extractLocalityVariants(locality);
-    console.log(`Geocoding "${locality}" — trying variants:`, variants);
+// ── Generic geographic feature word detection ─────────────────────────────────
+// Some locality candidates are just a bare geographic feature word (or a
+// feature word + another feature word), with no actual proper name attached
+// — e.g. "Mara river", "Mara" (river name used alone), "Hills area". These
+// often DO exist as exact GeoNames entries (e.g. "Mara Serena Airport" for
+// "Mara"), but an exact hit on a generic word is not evidence that it's the
+// right place for THIS specimen — it's just a common word that happens to
+// also be part of an unrelated place's name. A real, deliberately-named
+// locality (even if it needs a fuzzy/spelling correction, e.g. "Lolgories"
+// for "Lolgorien") should be preferred over an exact-but-generic hit.
+const GENERIC_FEATURE_WORDS = new Set([
+    'river', 'mara', 'hill', 'hills', 'valley', 'forest', 'area', 'road',
+    'ridge', 'stream', 'lake', 'mountain', 'mount', 'peak', 'peaks',
+    'plain', 'plains', 'falls', 'springs', 'swamp', 'gorge', 'escarpment'
+]);
 
-    for (const variant of variants) {
-        // Try GeoNames first for this variant
-        const geoResult = await geocodeGeoNames(variant);
-        if (geoResult) {
-            console.log(`✅ GeoNames matched "${variant}": ${geoResult.display} (${geoResult.lat}, ${geoResult.lon})`);
-            if (geocodeLog) {
-                geocodeLog.finalLocalityUsed = geocodeLog.finalLocalityUsed || locality;
-                geocodeLog.geocodeSource = geoResult.source;
-                geocodeLog.matchedTerm = variant;
-                geocodeLog.lat = geoResult.lat;
-                geocodeLog.lon = geoResult.lon;
-            }
-            return { ...geoResult, matchedTerm: variant };
+// A candidate counts as "generic" only if EVERY word in it is itself a bare
+// feature word — e.g. "Mara river" → ["mara","river"], both generic. A real
+// named place like "Naro Moru" or "Gamia Peaks" has at least one word that
+// isn't a generic feature term, so it's treated as specific even though it
+// may also contain a feature word like "Peaks".
+function isGenericCandidate(candidate) {
+    const words = candidate.toLowerCase().trim().split(/\s+/).filter(Boolean);
+    if (words.length === 0) return true;
+    return words.every(w => GENERIC_FEATURE_WORDS.has(w));
+}
+
+
+//
+// This replaces the old "one locality string in, fuzzy-fallback through its
+// variants" approach. Herbarium labels often carry SEVERAL place names of
+// very different reliability (a small peak/valley/ridge name plus a large,
+// well-known landmark, plus sometimes a bare generic feature word like a
+// river name). Treating "most specific" or "first extracted" as "best" let
+// two different failure modes through:
+//   (a) a vague/garbled small-feature name fuzzy-matched an unrelated place
+//       far from the landmark the label actually describes (the Gamba case)
+//   (b) a bare generic word (e.g. "Mara") returned a real but WRONG exact
+//       GeoNames hit, pre-empting a real, specifically-named locality that
+//       only needed a fuzzy spelling correction to resolve correctly (the
+//       Lolgorien case)
+//
+// Strategy — four strict tiers, run in this order, each only attempted if
+// every earlier tier found nothing acceptable:
+//   1. EXACT match, over NON-GENERIC (specifically-named) candidates only.
+//   2. FUZZY match, over NON-GENERIC candidates only — but instead of
+//      returning the first hit found, every fuzzy hit across every
+//      non-generic candidate's variants is collected and scored by
+//      normalized edit distance to its own query term, and the BEST
+//      (closest spelling) match wins. This is what lets "Lolgories" beat
+//      out a worse fuzzy hit from another candidate just because that
+//      other candidate happened to be tried first.
+//   3. EXACT match, over GENERIC candidates (bare feature words) — only
+//      reached if no real named candidate resolved at all.
+//   4. FUZZY match, over GENERIC candidates — last resort.
+// A KNOWN_ANCHOR (e.g. "Mount Kenya"), if present among the candidates, is
+// used throughout as a distance sanity check: any match (in any tier) that
+// lands implausibly far from the anchor is rejected and the search moves on.
+async function geocodeCandidates(candidates) {
+    if (!candidates || candidates.length === 0) return null;
+
+    // ── Step 0: extract disambiguation hints (county/district names) ───────
+    // A county/district name mentioned anywhere on the label (e.g. "Narok
+    // District") isn't itself geocoded as a locality — it's too broad to be
+    // useful as "the" specimen location — but it IS used to disambiguate
+    // OTHER candidates that share a name with more than one real place (the
+    // clearest case being "Ewaso Nyiro", which names two distinct rivers in
+    // different counties).
+    const disambiguationHints = extractDisambiguationHints(candidates);
+    if (disambiguationHints.length > 0) {
+        console.log('🗺️ Disambiguation hints found on label (county/district names):', disambiguationHints);
+        if (geocodeLog) geocodeLog.disambiguationHints = disambiguationHints;
+    }
+
+    // ── Step 1: anchor detection ────────────────────────────────────────────
+    let anchorPoint = null; // { lat, lon, radiusKm, label }
+    const foundAnchor = findKnownAnchor(candidates);
+    if (foundAnchor) {
+        console.log(`📍 Known landmark anchor detected in candidates: "${foundAnchor.candidate}" → using as reference point (${foundAnchor.anchor.lat}, ${foundAnchor.anchor.lon}, radius ${foundAnchor.anchor.radiusKm}km)`);
+        anchorPoint = {
+            lat: foundAnchor.anchor.lat,
+            lon: foundAnchor.anchor.lon,
+            radiusKm: foundAnchor.anchor.radiusKm,
+            label: foundAnchor.candidate
+        };
+        if (geocodeLog) {
+            geocodeLog.anchorUsed = foundAnchor.candidate;
+            geocodeLog.anchorLat = foundAnchor.anchor.lat;
+            geocodeLog.anchorLon = foundAnchor.anchor.lon;
+            geocodeLog.anchorRadiusKm = foundAnchor.anchor.radiusKm;
         }
+    } else {
+        console.log('No known landmark anchor found among candidates — proceeding without a distance sanity check.');
+    }
 
-        // Then Nominatim for the same variant
-        const nomResult = await geocodeNominatim(variant);
-        if (nomResult) {
-            console.log(`✅ Nominatim matched "${variant}": ${nomResult.display} (${nomResult.lat}, ${nomResult.lon})`);
-            if (geocodeLog) {
-                geocodeLog.finalLocalityUsed = geocodeLog.finalLocalityUsed || locality;
-                geocodeLog.geocodeSource = nomResult.source;
-                geocodeLog.matchedTerm = variant;
-                geocodeLog.lat = nomResult.lat;
-                geocodeLog.lon = nomResult.lon;
+    // Helper: checks a geocode result against the active anchor (if any).
+    // Returns true if acceptable (no anchor, or within radius).
+    function passesAnchorCheck(result, term) {
+        if (!anchorPoint) return true;
+        const distKm = haversineKm(anchorPoint.lat, anchorPoint.lon, result.lat, result.lon);
+        if (distKm <= anchorPoint.radiusKm) return true;
+        console.warn(`⚠️ Rejecting match for "${term}" — ${result.display || result.matchedName} is ${distKm.toFixed(0)}km from anchor "${anchorPoint.label}" (max allowed ${anchorPoint.radiusKm}km)`);
+        if (geocodeLog) {
+            geocodeLog.rejectedMatches = geocodeLog.rejectedMatches || [];
+            geocodeLog.rejectedMatches.push({
+                term, matchedName: result.matchedName || result.display, lat: result.lat, lon: result.lon,
+                distanceFromAnchorKm: Math.round(distKm), reason: 'too far from anchor'
+            });
+        }
+        return false;
+    }
+
+    // ── Step 2: split candidates into specific vs. generic, build term sets ──
+    const specificCandidates = candidates.filter(c => !isGenericCandidate(c));
+    const genericCandidates  = candidates.filter(c =>  isGenericCandidate(c));
+    if (geocodeLog) {
+        geocodeLog.specificCandidates = specificCandidates;
+        geocodeLog.genericCandidates  = genericCandidates;
+    }
+    console.log('Specifically-named candidates (tried first):', specificCandidates);
+    console.log('Bare generic feature-word candidates (tried last):', genericCandidates);
+
+    function buildTermSets(candidateList) {
+        return candidateList.map(c => {
+            const seen = new Set();
+            const terms = [];
+            for (const v of extractLocalityVariants(c)) {
+                const key = v.toLowerCase();
+                if (!seen.has(key)) { seen.add(key); terms.push(v); }
             }
-            return { ...nomResult, matchedTerm: variant };
+            return { candidate: c, terms };
+        });
+    }
+
+    // ── Tier 1: EXACT match over specific candidates only ───────────────────
+    const specificTermSets = buildTermSets(specificCandidates);
+    console.log('── Tier 1: exact match, specifically-named candidates ──');
+    for (const { candidate, terms } of specificTermSets) {
+        for (const term of terms) {
+            const geoResult = await geocodeGeoNames(term, /* allowFuzzy */ false, disambiguationHints);
+            if (geoResult && passesAnchorCheck(geoResult, term)) {
+                console.log(`✅ [exact-specific] GeoNames matched "${term}" (from candidate "${candidate}"): ${geoResult.display}`);
+                return { ...geoResult, matchedTerm: term, matchTier: 'exact-specific' };
+            }
+            const nomResult = await geocodeNominatim(term, /* allowFuzzy */ false, disambiguationHints);
+            if (nomResult && passesAnchorCheck(nomResult, term)) {
+                console.log(`✅ [exact-specific] Nominatim matched "${term}" (from candidate "${candidate}"): ${nomResult.display}`);
+                return { ...nomResult, matchedTerm: term, matchTier: 'exact-specific' };
+            }
         }
     }
 
-    console.warn(`❌ No geocoder matched any variant of: "${locality}"`);
+    // ── Tier 2: FUZZY match over specific candidates, BEST-SCORE wins ──────
+    // Unlike tier 1, we don't return on first hit. We collect every fuzzy hit
+    // across every specific candidate's terms, score each by normalized edit
+    // distance (how close the matched name is to the term that found it),
+    // and keep only the best (lowest-distance) one. This prevents a worse
+    // fuzzy match on an earlier-tried candidate from beating a better fuzzy
+    // match on a later candidate purely due to ordering.
+    console.log('── Tier 2: fuzzy match, specifically-named candidates (best score wins) ──');
+    let bestFuzzy = null; // { result, term, candidate, score }
+    for (const { candidate, terms } of specificTermSets) {
+        for (const term of terms) {
+            const geoResult = await geocodeGeoNames(term, /* allowFuzzy */ true, disambiguationHints);
+            if (geoResult && passesAnchorCheck(geoResult, term)) {
+                const score = levenshtein(term.toLowerCase(), (geoResult.matchedName || geoResult.display || '').toLowerCase())
+                    / Math.max(term.length, (geoResult.matchedName || geoResult.display || term).length, 1);
+                console.log(`   fuzzy candidate: "${candidate}" / term "${term}" → "${geoResult.matchedName}" (score ${score.toFixed(3)})`);
+                if (!bestFuzzy || score < bestFuzzy.score) {
+                    bestFuzzy = { result: geoResult, term, candidate, score, source: 'GeoNames' };
+                }
+            }
+            const nomResult = await geocodeNominatim(term, /* allowFuzzy */ true, disambiguationHints);
+            if (nomResult && passesAnchorCheck(nomResult, term)) {
+                const matchedShortName = (nomResult.display || '').split(',')[0];
+                const score = levenshtein(term.toLowerCase(), matchedShortName.toLowerCase())
+                    / Math.max(term.length, matchedShortName.length, 1);
+                console.log(`   fuzzy candidate: "${candidate}" / term "${term}" → "${matchedShortName}" (score ${score.toFixed(3)})`);
+                if (!bestFuzzy || score < bestFuzzy.score) {
+                    bestFuzzy = { result: nomResult, term, candidate, score, source: 'Nominatim' };
+                }
+            }
+        }
+    }
+    if (bestFuzzy) {
+        console.log(`✅ [fuzzy-specific] Best match: "${bestFuzzy.term}" (from candidate "${bestFuzzy.candidate}") → ${bestFuzzy.result.display} (score ${bestFuzzy.score.toFixed(3)})`);
+        return { ...bestFuzzy.result, matchedTerm: bestFuzzy.term, matchTier: 'fuzzy-specific' };
+    }
+
+    // ── Tier 3: EXACT match over generic candidates ─────────────────────────
+    // Only reached if no real named candidate resolved at all.
+    const genericTermSets = buildTermSets(genericCandidates);
+    console.log('── Tier 3: exact match, bare generic candidates (last resort before fuzzy-generic) ──');
+    for (const { candidate, terms } of genericTermSets) {
+        for (const term of terms) {
+            const geoResult = await geocodeGeoNames(term, /* allowFuzzy */ false, disambiguationHints);
+            if (geoResult && passesAnchorCheck(geoResult, term)) {
+                console.log(`✅ [exact-generic] GeoNames matched "${term}" (from candidate "${candidate}"): ${geoResult.display}`);
+                return { ...geoResult, matchedTerm: term, matchTier: 'exact-generic' };
+            }
+            const nomResult = await geocodeNominatim(term, /* allowFuzzy */ false, disambiguationHints);
+            if (nomResult && passesAnchorCheck(nomResult, term)) {
+                console.log(`✅ [exact-generic] Nominatim matched "${term}" (from candidate "${candidate}"): ${nomResult.display}`);
+                return { ...nomResult, matchedTerm: term, matchTier: 'exact-generic' };
+            }
+        }
+    }
+
+    // ── Tier 4: FUZZY match over generic candidates — absolute last resort ──
+    console.log('── Tier 4: fuzzy match, bare generic candidates (absolute last resort) ──');
+    for (const { candidate, terms } of genericTermSets) {
+        for (const term of terms) {
+            const geoResult = await geocodeGeoNames(term, /* allowFuzzy */ true, disambiguationHints);
+            if (geoResult && passesAnchorCheck(geoResult, term)) {
+                console.log(`✅ [fuzzy-generic] GeoNames matched "${term}" (from candidate "${candidate}"): ${geoResult.display}`);
+                return { ...geoResult, matchedTerm: term, matchTier: 'fuzzy-generic' };
+            }
+            const nomResult = await geocodeNominatim(term, /* allowFuzzy */ true, disambiguationHints);
+            if (nomResult && passesAnchorCheck(nomResult, term)) {
+                console.log(`✅ [fuzzy-generic] Nominatim matched "${term}" (from candidate "${candidate}"): ${nomResult.display}`);
+                return { ...nomResult, matchedTerm: term, matchTier: 'fuzzy-generic' };
+            }
+        }
+    }
+
+    // ── Step 3: nothing resolved within an acceptable distance ─────────────
+    // IMPORTANT: we do NOT fall back to the anchor's own coordinates here.
+    // An anchor exists only to REJECT matches that are implausibly far away —
+    // it is a sanity check, not a substitute answer. Returning the anchor's
+    // own point when nothing else qualifies would silently produce a low-
+    // precision, possibly misleading location (e.g. a generic country-level
+    // or landmark-level point standing in for a specific locality that was
+    // never actually resolved). It's better to surface "not found" to the
+    // user than to quietly hand back a wrong-but-plausible-looking coordinate.
+    if (anchorPoint && geocodeLog && geocodeLog.rejectedMatches && geocodeLog.rejectedMatches.length > 0) {
+        console.warn(`❌ No candidate resolved within ${anchorPoint.radiusKm}km of anchor "${anchorPoint.label}". Not falling back to the anchor's own coordinates — reporting as unresolved instead.`);
+    }
+
+    console.warn(`❌ No geocoder matched any candidate or variant of:`, candidates);
     return null;
+}
+
+
+// Backward-compatible single-string wrapper, kept for any external callers
+// still passing one locality string instead of a candidates array.
+async function geocode(locality) {
+    return geocodeCandidates([locality]);
 }
 
 // ─── UI helpers ───────────────────────────────────────────────────────────────
@@ -1005,7 +1614,10 @@ function showResults(extracted, coords, calcMGRS, method, originalLocality) {
 
     document.getElementById('rSpecies').innerHTML   = extracted.species_name   || '<span style="color:#8a9a8a;font-style:italic;font-family:Inter,sans-serif">not found</span>';
     document.getElementById('rMGRS').innerText      = extracted.mgrs_coordinates || '—';
-    document.getElementById('rLocality').innerText  = originalLocality || extracted.locality || '—';
+    const candidateList = extracted.locality_candidates || [];
+    document.getElementById('rLocality').innerText  = candidateList.length > 1
+        ? candidateList.join('  →  ')
+        : (originalLocality || extracted.locality || '—');
     document.getElementById('rCollector').innerText = extracted.collector || '—';
     document.getElementById('rDate').innerText      = extracted.collection_date || '—';
     document.getElementById('rMethod').innerText    = method;
@@ -1038,13 +1650,16 @@ function showResults(extracted, coords, calcMGRS, method, originalLocality) {
         finalMGRS = '—';
         finalNote = 'insufficient data on label';
     } else if (!coords && !extracted.mgrs_coordinates) {
-        const localityStr = extracted.locality ? `"${extracted.locality}"` : 'the extracted locality';
-        vCard.innerHTML = `<div class="validation-card fail"><div class="validation-title">Locality not found in Kenya</div><div class="validation-body">${localityStr} could not be matched to a location within Kenya. The place name may be misspelled, too vague, or outside Kenya's boundaries.</div></div>`;
+        const candidateList = extracted.locality_candidates || [];
+        const localityStr = candidateList.length > 0 ? `"${candidateList.join('", "')}"` : 'the extracted locality candidates';
+        vCard.innerHTML = `<div class="validation-card fail"><div class="validation-title">Locality not found in Kenya</div><div class="validation-body">None of ${localityStr} could be matched to a location within Kenya. The place names may be misspelled, too vague, or outside Kenya's boundaries.</div></div>`;
         finalMGRS = '—';
-        finalNote = 'geocoding failed — locality unresolved';
+        finalNote = 'geocoding failed — no locality candidate resolved';
     } else if (!extracted.mgrs_coordinates) {
-        const placeLabel = coords.display ? coords.display.split(',')[0] : extracted.locality;
-        vCard.innerHTML = `<div class="validation-card info"><div class="validation-title">No MGRS on label — derived from locality</div><div class="validation-body">No MGRS grid reference was found on the label. Locality <strong>"${extracted.locality}"</strong> was geocoded to <strong>${coords.lat.toFixed(4)}°, ${coords.lon.toFixed(4)}°</strong> (matched: ${placeLabel}) and converted to MGRS.</div></div>`;
+        const placeLabel = coords.display ? coords.display.split(',')[0] : (coords.matchedTerm || extracted.locality);
+        const matchedVia = coords.matchedTerm && coords.matchedTerm !== extracted.locality
+            ? ` (matched via candidate "<strong>${coords.matchedTerm}</strong>")` : '';
+        vCard.innerHTML = `<div class="validation-card info"><div class="validation-title">No MGRS on label — derived from locality</div><div class="validation-body">No MGRS grid reference was found on the label. Locality candidate <strong>"${coords.matchedTerm || extracted.locality}"</strong> was geocoded to <strong>${coords.lat.toFixed(4)}°, ${coords.lon.toFixed(4)}°</strong> (matched: ${placeLabel})${matchedVia} and converted to MGRS.</div></div>`;
         finalNote = 'no MGRS on label — derived from locality geocode';
     } else if (!coords) {
         vCard.innerHTML = `<div class="validation-card info"><div class="validation-title">MGRS present — locality unresolved</div><div class="validation-body">An MGRS value was found on the label but the locality could not be geocoded within Kenya, so cross-validation was not possible. Using recorded MGRS.</div></div>`;
@@ -1151,42 +1766,48 @@ async function processFile(file) {
     }
 
     // Reset the geocode activity log for this specimen now that we know the
-    // raw locality string that came out of extraction.
-    resetGeocodeLog(extracted.locality || null);
+    // raw locality candidates that came out of extraction.
+    const rawCandidates = extracted.locality_candidates || [];
+    resetGeocodeLog(extracted.locality || null, rawCandidates);
 
-    // ── Step 3: Spell-check + geocode locality ──────────────────────────────────
-    // spellCheckLocality tries the ORIGINAL locality first (verified via GeoNames/
-    // Nominatim) before ever accepting an LLM spelling suggestion, and only
-    // accepts a suggested correction if THAT also resolves to a real place.
+    // ── Step 3/4: Geocode using ALL locality candidates ──────────────────────
+    // geocodeCandidates() runs an anchor-aware, exact-before-fuzzy pass across
+    // every candidate the label offered (most specific AND most general, e.g.
+    // both "Gamia Peaks" and "Mount Kenya"). This prevents a vague or garbled
+    // small-feature name from fuzzy-matching an unrelated, distant place ahead
+    // of a clean match on a well-known landmark.
     setStep('step-spell', 'active');
     const originalLocality = extracted.locality;
     let coords = null;
 
-    if (extracted.locality) {
-        const result = await spellCheckLocality(extracted.locality);
-        extracted.locality = result.corrected;
-        coords = result.coords; // may already be resolved from the spell-check verification
-        if (extracted.locality !== originalLocality) {
-            console.log(`Locality corrected: "${originalLocality}" → "${extracted.locality}"`);
-        }
-        if (coords && geocodeLog) {
-            geocodeLog.finalLocalityUsed = geocodeLog.finalLocalityUsed || coords.matchedTerm || extracted.locality;
-            geocodeLog.geocodeSource = coords.source;
-            geocodeLog.matchedTerm = coords.matchedTerm || geocodeLog.matchedTerm;
-            geocodeLog.lat = coords.lat;
-            geocodeLog.lon = coords.lon;
-        }
+    if (rawCandidates.length > 0) {
+        try {
+            coords = await geocodeCandidates(rawCandidates);
+        } catch(e) { console.warn('Candidate geocoding failed:', e); }
     }
     setStep('step-spell', 'done');
 
-    // ── Step 4: Geocode locality (fallback) ─────────────────────────────────────
-    // If spellCheckLocality already resolved coordinates, skip re-geocoding.
-    // Otherwise run the full geocode() pipeline as a last attempt.
+    // ── Step 4b: Spell-check fallback ────────────────────────────────────────
+    // Only reached if NONE of the raw candidates (exact or fuzzy, anchor-
+    // checked) resolved. As a last resort, ask the LLM for a cautious spelling
+    // correction of the top (most specific) candidate, but only accept it if
+    // the corrected spelling itself independently resolves to a real place.
     setStep('step-geocode', 'active');
-    if (!coords && extracted.locality) {
-        try {
-            coords = await geocode(extracted.locality);
-        } catch(e) { console.warn('Geocoding failed:', e); }
+    if (!coords && originalLocality) {
+        const result = await spellCheckLocality(originalLocality);
+        if (result.corrected !== originalLocality) {
+            extracted.locality = result.corrected;
+            console.log(`Locality corrected: "${originalLocality}" → "${extracted.locality}"`);
+        }
+        coords = result.coords;
+    }
+    if (coords && geocodeLog) {
+        geocodeLog.finalLocalityUsed = coords.matchedTerm || geocodeLog.finalLocalityUsed || extracted.locality;
+        geocodeLog.geocodeSource = coords.source;
+        geocodeLog.matchedTerm = coords.matchedTerm || geocodeLog.matchedTerm;
+        geocodeLog.matchTier = coords.matchTier || geocodeLog.matchTier;
+        geocodeLog.lat = coords.lat;
+        geocodeLog.lon = coords.lon;
     }
     setStep('step-geocode', coords ? 'done' : '');
 
