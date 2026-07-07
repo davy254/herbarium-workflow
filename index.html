@@ -404,6 +404,10 @@
                         <div class="field-val" id="rSpecies">—</div>
                     </div>
                     <div class="field-row">
+                        <div class="field-key">Author citation</div>
+                        <div class="field-val" id="rAuthor">—</div>
+                    </div>
+                    <div class="field-row">
                         <div class="field-key">Recorded MGRS</div>
                         <div class="field-val" id="rMGRS">—</div>
                     </div>
@@ -414,6 +418,10 @@
                     <div class="field-row" id="rowLocalityCorrected" style="display:none">
                         <div class="field-key">Locality (corrected)</div>
                         <div class="field-val" id="rLocalityCorrected" style="color:#2a6e3e">—</div>
+                    </div>
+                    <div class="field-row">
+                        <div class="field-key">Locality used<br>(geocoding)</div>
+                        <div class="field-val" id="rLocalityUsed" style="color:#2a4e82">—</div>
                     </div>
                     <div class="field-row">
                         <div class="field-key">Collector</div>
@@ -648,6 +656,65 @@ const MGRS = {
     }
 };
 
+// ─── Scientific name / author citation splitter ───────────────────────────────
+// Herbarium labels and vision/OCR extraction commonly return the species name
+// and its author citation as one combined string, e.g. "Uvaria lucida Benth."
+// Botanically, the "species name" is just the genus + specific (and, where
+// present, infraspecific) epithet — "Uvaria lucida" — while "Benth." is the
+// author citation and belongs in its own field. This is a deterministic,
+// code-level safety net (the extraction prompts also ask the model to
+// separate these directly, but we never rely on that alone, exactly like the
+// locality-candidate cleanup above).
+//
+// Approach: epithets in a scientific name are always lowercase (genus is
+// capitalized, but only the FIRST word). An author citation begins as soon as
+// we hit a token that is not a lowercase epithet/rank-abbreviation word — i.e.
+// a capitalized author abbreviation ("Benth.", "R.Br."), a parenthesis
+// (basionym author, e.g. "(Vahl) Benth."), or a connector like "ex"/"&" that
+// precedes one. Infraspecific rank markers ("var.", "subsp.", "ssp.", "f.",
+// "forma", "cv.") are lowercase and are kept as part of the species name.
+function splitScientificName(fullName) {
+    if (!fullName || typeof fullName !== 'string') return { species: null, author: null };
+    const trimmed = fullName.trim().replace(/\s+/g, ' ');
+    if (!trimmed) return { species: null, author: null };
+
+    const tokens = trimmed.split(' ');
+    const speciesTokens = [];
+    let i = 0;
+
+    // First token is always the genus — capitalized, kept unconditionally.
+    if (tokens.length > 0) {
+        speciesTokens.push(tokens[0]);
+        i = 1;
+    }
+
+    // A token is part of the species/infraspecific epithet if it is entirely
+    // lowercase letters (allowing hyphens, apostrophes and a trailing period
+    // for rank abbreviations like "var." or "f."). The moment we hit a token
+    // that doesn't match — capitalized, a parenthesis, an ampersand, a
+    // standalone "ex"/"in" connector before a capitalized author — the
+    // species name is complete and everything remaining is author citation.
+    const EPITHET_RE = /^[a-z\u00E0-\u017F][a-z\u00E0-\u017F'-]*\.?$/;
+
+    while (i < tokens.length) {
+        const tok = tokens[i];
+        if (EPITHET_RE.test(tok)) {
+            speciesTokens.push(tok);
+            i++;
+        } else {
+            break;
+        }
+    }
+
+    const species = speciesTokens.join(' ').trim();
+    const remainder = tokens.slice(i).join(' ').trim();
+
+    return {
+        species: species || trimmed,
+        author: remainder.length > 0 ? remainder : null
+    };
+}
+
 // ─── API helpers ──────────────────────────────────────────────────────────────
 async function callAPI(model, messages) {
     const res = await fetch(BACKEND_URL, {
@@ -757,15 +824,24 @@ async function visionExtract(base64, mimeType) {
 
 Extract and return ONLY valid JSON with these fields:
 {
-  "species_name": "full scientific name or null",
+  "species_name": "genus + specific/infraspecific epithet ONLY, e.g. 'Uvaria lucida' — or null",
+  "author_citation": "the taxonomic author citation ONLY, e.g. 'Benth.' or '(Vahl) Benth.' — or null if none is present",
   "mgrs_coordinates": "MGRS string exactly as written on the label, or null if not present",
   "locality_candidates": ["ordered array of every place name mentioned on the label, MOST SPECIFIC FIRST, MOST GENERAL LAST"],
   "collection_date": "date as written or null",
   "collector": "collector name(s) or null"
 }
 
-IMPORTANT RULES:
-- For locality_candidates: extract EVERY distinct place name on the label — not just the most specific one. Herbarium labels often mention a small feature (a peak, valley, ridge, stream) AND a larger, well-known landmark (a mountain, forest, county, or national park) in the same description. Include all of them as separate array entries.
+IMPORTANT RULES FOR species_name / author_citation:
+- The label typically reads the scientific name and its author together, e.g. "Uvaria lucida Benth." — you MUST split these into two separate fields.
+- species_name is ONLY the genus and specific epithet (and infraspecific rank + epithet if present, e.g. "var. kirkii"). NEVER include the author's name/abbreviation in species_name.
+- author_citation is everything that names the author(s) who published the name — abbreviated surnames, initials, "ex", "&", or parenthetical basionym authors (e.g. "Benth.", "R.Br.", "(Vahl) Benth.", "Baker f."). This is NOT part of the species name itself.
+- Example: label text "Uvaria lucida Benth." → species_name: "Uvaria lucida", author_citation: "Benth."
+- Example: label text "Acacia mellifera (Vahl) Benth." → species_name: "Acacia mellifera", author_citation: "(Vahl) Benth."
+- If no author citation is visible, set author_citation to null and do not guess one.
+
+IMPORTANT RULES FOR locality_candidates:
+- Extract EVERY distinct place name on the label — not just the most specific one. Herbarium labels often mention a small feature (a peak, valley, ridge, stream) AND a larger, well-known landmark (a mountain, forest, county, or national park) in the same description. Include all of them as separate array entries.
 - Order the array from most specific (e.g. 'Gamia Peaks', 'Teleki Valley') to most general (e.g. 'Mount Kenya'). The most general, most well-known entry is often the most reliable for geocoding, even though it's listed last.
 - Use just the place name itself for each entry, not a full sentence (e.g. 'Teleki Valley' not 'near Teleki Valley below the peak').
 - NEVER include a purely descriptive phrase as its own candidate, even if it also contains a real place name within it. For example, if the label reads "small hill at the western side of Ngong hills", do NOT add "small hill at the western side of Ngong hills" as a candidate — only add the actual place name extracted from it, i.e. 'Ngong hills' (and 'Ngong'). A candidate should be a name you could look up on a map, not a description of where something is relative to a name.
@@ -791,15 +867,24 @@ Return only the JSON object, no other text.`;
 async function textExtract(ocrText) {
     const prompt = `You are a botanical data extraction assistant specialising in Kenyan herbarium specimens. Extract specimen data from this OCR text and return ONLY valid JSON:
 {
-  "species_name": "full scientific name or null",
+  "species_name": "genus + specific/infraspecific epithet ONLY, e.g. 'Uvaria lucida' — or null",
+  "author_citation": "the taxonomic author citation ONLY, e.g. 'Benth.' or '(Vahl) Benth.' — or null if none is present",
   "mgrs_coordinates": "MGRS string exactly as written, or null if not present",
   "locality_candidates": ["ordered array of every place name found in the text, MOST SPECIFIC FIRST, MOST GENERAL LAST"],
   "collection_date": "date as written or null",
   "collector": "collector name(s) or null"
 }
 
-IMPORTANT RULES:
-- For locality_candidates: extract EVERY distinct place name in the text — not just the most specific one. Herbarium labels often mention a small feature (a peak, valley, ridge, stream) AND a larger, well-known landmark (a mountain, forest, county, or national park). Include all of them as separate array entries.
+IMPORTANT RULES FOR species_name / author_citation:
+- OCR text typically reads the scientific name and its author together, e.g. "Uvaria lucida Benth." — you MUST split these into two separate fields.
+- species_name is ONLY the genus and specific epithet (and infraspecific rank + epithet if present, e.g. "var. kirkii"). NEVER include the author's name/abbreviation in species_name.
+- author_citation is everything that names the author(s) who published the name — abbreviated surnames, initials, "ex", "&", or parenthetical basionym authors (e.g. "Benth.", "R.Br.", "(Vahl) Benth.", "Baker f."). This is NOT part of the species name itself.
+- Example: text "Uvaria lucida Benth." → species_name: "Uvaria lucida", author_citation: "Benth."
+- Example: text "Acacia mellifera (Vahl) Benth." → species_name: "Acacia mellifera", author_citation: "(Vahl) Benth."
+- If no author citation is present, set author_citation to null and do not guess one.
+
+IMPORTANT RULES FOR locality_candidates:
+- Extract EVERY distinct place name in the text — not just the most specific one. Herbarium labels often mention a small feature (a peak, valley, ridge, stream) AND a larger, well-known landmark (a mountain, forest, county, or national park). Include all of them as separate array entries.
 - Order the array from most specific to most general. The most general, most well-known entry (e.g. 'Mount Kenya', 'Tsavo East') is often the most reliable for geocoding, even though it's listed last.
 - Use just the place name itself for each entry, not a full sentence.
 - NEVER include a purely descriptive phrase as its own candidate, even if it also contains a real place name within it. For example, if the text reads "small hill at the western side of Ngong hills", do NOT add "small hill at the western side of Ngong hills" as a candidate — only add the actual place name extracted from it, i.e. 'Ngong hills' (and 'Ngong'). A candidate should be a name you could look up on a map, not a description of where something is relative to a name.
@@ -919,6 +1004,30 @@ function normalizeExtracted(extracted) {
     // Keep `locality` populated as the top (most specific) candidate for any
     // older code paths / UI fields that still read a singular value.
     extracted.locality = candidates.length > 0 ? candidates[0] : null;
+
+    // ── Species name / author citation split ────────────────────────────────
+    // Even though the extraction prompt now asks the model to return these as
+    // two separate fields, we never rely on prompt-following alone (same
+    // philosophy as the locality-candidate cleanup above). If the model still
+    // returns a combined string in species_name (e.g. "Uvaria lucida Benth."),
+    // or returns author_citation as null while it's actually embedded in
+    // species_name, this deterministically splits them apart.
+    const rawSpecies = typeof extracted.species_name === 'string' ? extracted.species_name.trim() : null;
+    const llmAuthor = typeof extracted.author_citation === 'string' && extracted.author_citation.trim().length > 0
+        ? extracted.author_citation.trim()
+        : null;
+
+    if (rawSpecies) {
+        const { species, author } = splitScientificName(rawSpecies);
+        extracted.species_name = species;
+        // Prefer whatever the LLM already isolated correctly; otherwise fall
+        // back to what our deterministic splitter pulled off the combined string.
+        extracted.author_citation = llmAuthor || author || null;
+    } else {
+        extracted.species_name = null;
+        extracted.author_citation = llmAuthor;
+    }
+
     return extracted;
 }
 
@@ -1613,6 +1722,7 @@ function showResults(extracted, coords, calcMGRS, method, originalLocality) {
     document.getElementById('resultsAll').classList.add('visible');
 
     document.getElementById('rSpecies').innerHTML   = extracted.species_name   || '<span style="color:#8a9a8a;font-style:italic;font-family:Inter,sans-serif">not found</span>';
+    document.getElementById('rAuthor').innerHTML    = extracted.author_citation || '<span style="color:#8a9a8a;font-style:italic;font-family:Inter,sans-serif">not found</span>';
     document.getElementById('rMGRS').innerText      = extracted.mgrs_coordinates || '—';
     const candidateList = extracted.locality_candidates || [];
     document.getElementById('rLocality').innerText  = candidateList.length > 1
@@ -1622,6 +1732,18 @@ function showResults(extracted, coords, calcMGRS, method, originalLocality) {
     document.getElementById('rDate').innerText      = extracted.collection_date || '—';
     document.getElementById('rMethod').innerText    = method;
     document.getElementById('rGeoSource').innerText = coords ? coords.source : '—';
+
+    // Locality actually used for geocoding — the specific candidate/variant
+    // string that produced the successful geocode hit, not just the raw
+    // top-of-label locality. Falls back to a clear "not resolved" message
+    // when no candidate could be geocoded at all.
+    const localityUsedEl = document.getElementById('rLocalityUsed');
+    if (coords) {
+        const usedTerm = coords.matchedTerm || extracted.locality || '—';
+        localityUsedEl.innerText = usedTerm;
+    } else {
+        localityUsedEl.innerHTML = '<span style="color:#8a9a8a;font-style:italic;font-family:Inter,sans-serif">not resolved</span>';
+    }
 
     // Show corrected locality row only if it actually changed
     if (extracted.locality && originalLocality && extracted.locality !== originalLocality) {
