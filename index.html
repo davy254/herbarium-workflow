@@ -627,10 +627,17 @@ const MGRS = {
         return m ? m[3] : null;
     },
 
-    // Returns { zone, band, square } from an MGRS string
+    // Returns { zone, band, square } from an MGRS string.
+    // NOTE: this pattern is intentionally NOT anchored to the start of the
+    // string. Recorded label values are copied verbatim during extraction
+    // (by design — see the extraction prompts), so they can carry a leading
+    // label like "UTM " or "MGRS:" before the actual grid reference (e.g.
+    // "UTM 37MBK4042"). An anchored `^` match would fail on anything with a
+    // non-digit prefix and silently return null here, which previously made
+    // alToAA() bail out and made the AL→AA conversion appear to do nothing.
     parsePrefix(str) {
         if (!str) return null;
-        const m = str.toUpperCase().replace(/\s+/g,'').match(/^(\d{1,2})([C-XY])([A-HJ-NP-Z]{2})/);
+        const m = str.toUpperCase().replace(/\s+/g,'').match(/(\d{1,2})([C-XY])([A-HJ-NP-Z]{2})/);
         if (!m) return null;
         return { zone: m[1], band: m[2], square: m[3] };
     },
@@ -1774,6 +1781,34 @@ function showResults(extracted, coords, calcMGRS, method, originalLocality, conv
     // scheme to the current AA scheme (see MGRS.alToAA). Render that outcome
     // here and return early — the geocoding-based validation branches below
     // never apply in this case, since there was nothing to geocode.
+    // If MGRS was present on the label but couldn't be parsed at all (e.g. an
+    // unexpected format), say so explicitly rather than silently falling
+    // through to the geocoding-comparison logic below with nothing to
+    // compare against — that previously made the recorded value get echoed
+    // back unchanged as if it had been validated, with no indication that
+    // parsing had actually failed.
+    if (extracted.mgrs_coordinates && !convertedMGRS) {
+        document.getElementById('rGeoSource').innerText = 'not used — MGRS present on label';
+        document.getElementById('rowLocalityCorrected').style.display = 'none';
+        document.getElementById('rLocalityUsed').innerHTML =
+            '<span style="color:#8a9a8a;font-style:italic;font-family:Inter,sans-serif">geocoding skipped — MGRS present on label</span>';
+        document.getElementById('rLatLon').innerText   = 'Not calculated — geocoding skipped';
+        document.getElementById('rCalcMGRS').innerText = '—';
+        document.getElementById('validationCard').innerHTML = `<div class="validation-card fail">
+            <div class="validation-title">Could not parse recorded MGRS</div>
+            <div class="validation-body">
+                The recorded value <strong>${extracted.mgrs_coordinates}</strong> does not match the expected
+                MGRS pattern (zone + band + 100&nbsp;km square + easting/northing digits), so the AL → AA
+                scheme conversion could not be applied. Check the value against the label image — it may
+                need manual correction.
+            </div>
+        </div>`;
+        document.getElementById('finalMGRS').innerText = '—';
+        document.getElementById('finalNote').innerText  = 'recorded MGRS unparseable — AL→AA conversion not applied';
+        document.getElementById('methodBadge').innerText = method;
+        return;
+    }
+
     if (convertedMGRS) {
         document.getElementById('rGeoSource').innerText = 'not used — MGRS present on label';
         document.getElementById('rowLocalityCorrected').style.display = 'none';
@@ -1989,7 +2024,11 @@ async function processFile(file) {
         // in this path.
         ['step-spell', 'step-geocode', 'step-convert'].forEach(s => setStep(s, 'done'));
         convertedMGRS = MGRS.alToAA(extracted.mgrs_coordinates);
-        console.log(`MGRS present on label ("${extracted.mgrs_coordinates}") — skipping geocoding, converting AL → AA scheme directly: ${convertedMGRS}`);
+        if (convertedMGRS) {
+            console.log(`MGRS present on label ("${extracted.mgrs_coordinates}") — skipping geocoding, converting AL → AA scheme directly: ${convertedMGRS}`);
+        } else {
+            console.error(`⚠️ Could not parse recorded MGRS "${extracted.mgrs_coordinates}" — AL→AA conversion failed. This will be reported in the UI rather than silently shown as unchanged.`);
+        }
         if (geocodeLog) {
             geocodeLog.finalLocalityUsed = '(skipped — MGRS present on label, converted AL→AA instead)';
         }
