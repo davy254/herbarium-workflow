@@ -1775,40 +1775,24 @@ function showResults(extracted, coords, calcMGRS, method, originalLocality, conv
     document.getElementById('rMethod').innerText    = method;
     document.getElementById('rGeoSource').innerText = coords ? coords.source : '—';
 
-    // ── MGRS already present on the label: AL → AA scheme conversion path ──
-    // When the label carried a recorded MGRS value, the main pipeline skips
-    // geocoding entirely and converts that value directly from the legacy AL
-    // scheme to the current AA scheme (see MGRS.alToAA). Render that outcome
-    // here and return early — the geocoding-based validation branches below
-    // never apply in this case, since there was nothing to geocode.
-    // If MGRS was present on the label but couldn't be parsed at all (e.g. an
-    // unexpected format), say so explicitly rather than silently falling
-    // through to the geocoding-comparison logic below with nothing to
-    // compare against — that previously made the recorded value get echoed
-    // back unchanged as if it had been validated, with no indication that
-    // parsing had actually failed.
-    if (extracted.mgrs_coordinates && !convertedMGRS) {
-        document.getElementById('rGeoSource').innerText = 'not used — MGRS present on label';
-        document.getElementById('rowLocalityCorrected').style.display = 'none';
-        document.getElementById('rLocalityUsed').innerHTML =
-            '<span style="color:#8a9a8a;font-style:italic;font-family:Inter,sans-serif">geocoding skipped — MGRS present on label</span>';
-        document.getElementById('rLatLon').innerText   = 'Not calculated — geocoding skipped';
-        document.getElementById('rCalcMGRS').innerText = '—';
-        document.getElementById('validationCard').innerHTML = `<div class="validation-card fail">
-            <div class="validation-title">Could not parse recorded MGRS</div>
-            <div class="validation-body">
-                The recorded value <strong>${extracted.mgrs_coordinates}</strong> does not match the expected
-                MGRS pattern (zone + band + 100&nbsp;km square + easting/northing digits), so the AL → AA
-                scheme conversion could not be applied. Check the value against the label image — it may
-                need manual correction.
-            </div>
-        </div>`;
-        document.getElementById('finalMGRS').innerText = '—';
-        document.getElementById('finalNote').innerText  = 'recorded MGRS unparseable — AL→AA conversion not applied';
-        document.getElementById('methodBadge').innerText = method;
-        return;
-    }
-
+    // ── MGRS already present on the label AND successfully parsed: AL → AA
+    // scheme conversion path ─────────────────────────────────────────────
+    // When the label carried a recorded MGRS value that parsed successfully,
+    // the main pipeline skips geocoding entirely and converts that value
+    // directly from the legacy AL scheme to the current AA scheme (see
+    // MGRS.alToAA). Render that outcome here and return early — the
+    // geocoding-based validation branches below never apply in this case,
+    // since there was nothing to geocode.
+    //
+    // NOTE: if MGRS was present on the label but couldn't be parsed (e.g. an
+    // OCR/vision misread of a digit as a letter, like "37MCK0182" read as
+    // "37MCKD182"), convertedMGRS will be falsy AND the pipeline will have
+    // already fallen back to geocoding the locality instead (see
+    // processFile()). In that case coords/calcMGRS will be populated from
+    // geocoding, so we deliberately do NOT return early here — execution
+    // falls through to the normal geocoding-result rendering further down,
+    // which reports the parse failure and shows the geocoded result instead
+    // of dead-ending on an unusable recorded value.
     if (convertedMGRS) {
         document.getElementById('rGeoSource').innerText = 'not used — MGRS present on label';
         document.getElementById('rowLocalityCorrected').style.display = 'none';
@@ -1876,6 +1860,12 @@ function showResults(extracted, coords, calcMGRS, method, originalLocality, conv
         document.getElementById('rCalcMGRS').innerText = '—';
     }
 
+    // Whether a recorded MGRS was present but failed to parse (and the
+    // pipeline therefore fell back to locality geocoding). Used below to
+    // pick the right validation-card wording so the user knows WHY
+    // geocoding ran even though the label had an MGRS value on it.
+    const mgrsParseFailed = !!(extracted.mgrs_coordinates && !convertedMGRS);
+
     const vCard = document.getElementById('validationCard');
     let finalMGRS = calcMGRS ? calcMGRS.full : '—';
     let finalNote = 'calculated from locality';
@@ -1884,18 +1874,44 @@ function showResults(extracted, coords, calcMGRS, method, originalLocality, conv
         vCard.innerHTML = `<div class="validation-card fail"><div class="validation-title">No coordinates or locality found</div><div class="validation-body">The label contains neither an MGRS reference nor a recognisable place name. Check image quality and try again.</div></div>`;
         finalMGRS = '—';
         finalNote = 'insufficient data on label';
+    } else if (!coords && mgrsParseFailed) {
+        // A recorded MGRS was present but unparseable, AND geocoding the
+        // locality also failed to resolve. Surface both problems clearly
+        // rather than silently falling through to a generic "no locality"
+        // message that wouldn't mention the recorded MGRS at all.
+        const candidateListStr = candidateList.length > 0 ? `"${candidateList.join('", "')}"` : 'the extracted locality candidates';
+        vCard.innerHTML = `<div class="validation-card fail">
+            <div class="validation-title">Recorded MGRS unparseable, and locality not found</div>
+            <div class="validation-body">
+                The recorded value <strong>${extracted.mgrs_coordinates}</strong> does not match the expected
+                MGRS pattern (zone + band + 100&nbsp;km square + easting/northing digits), so geocoding was
+                attempted as a fallback. However, none of ${candidateListStr} could be matched to a location
+                within Kenya either. Check the recorded MGRS and locality against the label image — manual
+                correction may be needed.
+            </div>
+        </div>`;
+        finalMGRS = '—';
+        finalNote = 'recorded MGRS unparseable and locality geocoding also failed';
     } else if (!coords && !extracted.mgrs_coordinates) {
-        const candidateList = extracted.locality_candidates || [];
-        const localityStr = candidateList.length > 0 ? `"${candidateList.join('", "')}"` : 'the extracted locality candidates';
-        vCard.innerHTML = `<div class="validation-card fail"><div class="validation-title">Locality not found in Kenya</div><div class="validation-body">None of ${localityStr} could be matched to a location within Kenya. The place names may be misspelled, too vague, or outside Kenya's boundaries.</div></div>`;
+        const candidateListStr = candidateList.length > 0 ? `"${candidateList.join('", "')}"` : 'the extracted locality candidates';
+        vCard.innerHTML = `<div class="validation-card fail"><div class="validation-title">Locality not found in Kenya</div><div class="validation-body">None of ${candidateListStr} could be matched to a location within Kenya. The place names may be misspelled, too vague, or outside Kenya's boundaries.</div></div>`;
         finalMGRS = '—';
         finalNote = 'geocoding failed — no locality candidate resolved';
-    } else if (!extracted.mgrs_coordinates) {
+    } else if (!extracted.mgrs_coordinates || mgrsParseFailed) {
+        // Covers both: (a) no MGRS was ever recorded on the label, and
+        // (b) an MGRS WAS recorded but couldn't be parsed, so the pipeline
+        // fell back to geocoding the locality instead. Case (b) gets an
+        // extra note explaining the fallback so it's clear why geocoding
+        // ran even though the label had an MGRS-looking value on it.
         const placeLabel = coords.display ? coords.display.split(',')[0] : (coords.matchedTerm || extracted.locality);
         const matchedVia = coords.matchedTerm && coords.matchedTerm !== extracted.locality
             ? ` (matched via candidate "<strong>${coords.matchedTerm}</strong>")` : '';
-        vCard.innerHTML = `<div class="validation-card info"><div class="validation-title">No MGRS on label — derived from locality</div><div class="validation-body">No MGRS grid reference was found on the label. Locality candidate <strong>"${coords.matchedTerm || extracted.locality}"</strong> was geocoded to <strong>${coords.lat.toFixed(4)}°, ${coords.lon.toFixed(4)}°</strong> (matched: ${placeLabel})${matchedVia} and converted to MGRS.</div></div>`;
-        finalNote = 'no MGRS on label — derived from locality geocode';
+        const parseFailNote = mgrsParseFailed
+            ? ` The recorded value "<strong>${extracted.mgrs_coordinates}</strong>" on the label could not be parsed as valid MGRS, so it was set aside in favor of this geocoded result.`
+            : '';
+        const title = mgrsParseFailed ? 'Recorded MGRS unparseable — derived from locality' : 'No MGRS on label — derived from locality';
+        vCard.innerHTML = `<div class="validation-card info"><div class="validation-title">${title}</div><div class="validation-body">Locality candidate <strong>"${coords.matchedTerm || extracted.locality}"</strong> was geocoded to <strong>${coords.lat.toFixed(4)}°, ${coords.lon.toFixed(4)}°</strong> (matched: ${placeLabel})${matchedVia} and converted to MGRS.${parseFailNote}</div></div>`;
+        finalNote = mgrsParseFailed ? 'recorded MGRS unparseable — derived from locality geocode instead' : 'no MGRS on label — derived from locality geocode';
     } else if (!coords) {
         vCard.innerHTML = `<div class="validation-card info"><div class="validation-title">MGRS present — locality unresolved</div><div class="validation-body">An MGRS value was found on the label but the locality could not be geocoded within Kenya, so cross-validation was not possible. Using recorded MGRS.</div></div>`;
         finalMGRS = extracted.mgrs_coordinates;
@@ -2010,8 +2026,16 @@ async function processFile(file) {
     let calcMGRS = null;
     let convertedMGRS = null;
 
+    // If the label carried an MGRS value, try to parse/convert it first.
+    // convertedMGRS stays null if parsing fails (e.g. an OCR/vision misread
+    // of a digit as a letter, such as "37MCK0182" read as "37MCKD182").
     if (extracted.mgrs_coordinates) {
-        // ── MGRS already present on the label: convert AL → AA scheme directly ──
+        convertedMGRS = MGRS.alToAA(extracted.mgrs_coordinates);
+    }
+
+    if (extracted.mgrs_coordinates && convertedMGRS) {
+        // ── MGRS present on label AND successfully parsed: convert AL → AA
+        // scheme directly ─────────────────────────────────────────────────
         // Older Kenyan herbarium labels often carry MGRS grid references
         // computed against legacy, pre-WGS84 ellipsoids (the "AL" 100 km
         // square lettering scheme). Rather than re-deriving a position via
@@ -2023,17 +2047,24 @@ async function processFile(file) {
         // spell-checking and coordinate derivation are all skipped entirely
         // in this path.
         ['step-spell', 'step-geocode', 'step-convert'].forEach(s => setStep(s, 'done'));
-        convertedMGRS = MGRS.alToAA(extracted.mgrs_coordinates);
-        if (convertedMGRS) {
-            console.log(`MGRS present on label ("${extracted.mgrs_coordinates}") — skipping geocoding, converting AL → AA scheme directly: ${convertedMGRS}`);
-        } else {
-            console.error(`⚠️ Could not parse recorded MGRS "${extracted.mgrs_coordinates}" — AL→AA conversion failed. This will be reported in the UI rather than silently shown as unchanged.`);
-        }
+        console.log(`MGRS present on label ("${extracted.mgrs_coordinates}") — skipping geocoding, converting AL → AA scheme directly: ${convertedMGRS}`);
         if (geocodeLog) {
             geocodeLog.finalLocalityUsed = '(skipped — MGRS present on label, converted AL→AA instead)';
         }
     } else {
-        // ── No MGRS on label: fall back to locality geocoding ───────────────
+        // ── No MGRS on label, OR an MGRS was recorded but couldn't be
+        // parsed: fall back to locality geocoding ──────────────────────────
+        // A recorded MGRS that fails to parse (e.g. a digit misread as a
+        // letter by vision/OCR) is not usable data on its own — rather than
+        // dead-ending with an error, treat it exactly like "no MGRS on
+        // label" and derive coordinates from the locality candidates
+        // instead. This is the fix for the failure mode where a garbled
+        // recorded value (like "UTM 37MCKD182") previously produced a
+        // "could not parse" error with no attempt at geocoding.
+        if (extracted.mgrs_coordinates && !convertedMGRS) {
+            console.error(`⚠️ Could not parse recorded MGRS "${extracted.mgrs_coordinates}" — falling back to geocoding from locality instead.`);
+        }
+
         // ── Step 3/4: Geocode using ALL locality candidates ──────────────────
         setStep('step-spell', 'active');
         if (rawCandidates.length > 0) {
