@@ -653,6 +653,41 @@ const MGRS = {
         const nums = this.parseNumerics(recordedStr);
         if (!nums) return null;
         return `${calcZone}${calcBand} ${calcSquare} ${nums.easting} ${nums.northing}`;
+    },
+
+    // ── AL scheme → AA scheme row-letter conversion ─────────────────────────
+    // MGRS 100km-square identifiers can be expressed in one of two lettering
+    // schemes, depending on which reference ellipsoid the underlying grid was
+    // originally computed against:
+    //   - AA scheme: the current NGA/WGS84 standard. This is what every
+    //     modern GPS receiver, GIS package, and fromLatLon() above produce.
+    //   - AL scheme: an older scheme tied to legacy, pre-WGS84 regional
+    //     ellipsoids (e.g. Clarke 1880 / War Office, historically used on
+    //     older Kenyan survey maps). Older herbarium labels can carry MGRS
+    //     grid references written this way.
+    // Both schemes share the same 20-letter row alphabet (A-V, excluding I
+    // and O) and the same column alphabet, but the ROW letter is offset by
+    // exactly 10 positions (half the 20-letter cycle) between the two
+    // schemes. The COLUMN letter is unchanged. E.g. row letter "K" (index 9)
+    // in AL corresponds to row letter "V" (index 19) in AA:
+    // (9 + 10) % 20 = 19 → 37M BK 4042 (AL) → 37M BV 4042 (AA).
+    ROW_ALPHABET_20: 'ABCDEFGHJKLMNPQRSTUV',
+
+    // Converts a recorded MGRS string (assumed to be in the legacy AL
+    // scheme) to the current AA scheme. Zone, band, column letter, and the
+    // numeric easting/northing digits are all preserved unchanged — only the
+    // row letter is remapped. Returns null if the string can't be parsed.
+    alToAA(mgrsStr) {
+        const prefix = this.parsePrefix(mgrsStr);
+        const nums = this.parseNumerics(mgrsStr);
+        if (!prefix || !nums) return null;
+        const colLetter = prefix.square[0];
+        const rowLetterAL = prefix.square[1];
+        const rowIdx = this.ROW_ALPHABET_20.indexOf(rowLetterAL);
+        if (rowIdx === -1) return null;
+        const rowLetterAA = this.ROW_ALPHABET_20[(rowIdx + 10) % 20];
+        const newSquare = colLetter + rowLetterAA;
+        return `${prefix.zone}${prefix.band} ${newSquare} ${nums.easting} ${nums.northing}`;
     }
 };
 
@@ -1717,7 +1752,7 @@ function setStep(id, state) {
     el.className = 'progress-step ' + state;
 }
 
-function showResults(extracted, coords, calcMGRS, method, originalLocality) {
+function showResults(extracted, coords, calcMGRS, method, originalLocality, convertedMGRS) {
     document.getElementById('emptyState').style.display = 'none';
     document.getElementById('resultsAll').classList.add('visible');
 
@@ -1732,6 +1767,49 @@ function showResults(extracted, coords, calcMGRS, method, originalLocality) {
     document.getElementById('rDate').innerText      = extracted.collection_date || '—';
     document.getElementById('rMethod').innerText    = method;
     document.getElementById('rGeoSource').innerText = coords ? coords.source : '—';
+
+    // ── MGRS already present on the label: AL → AA scheme conversion path ──
+    // When the label carried a recorded MGRS value, the main pipeline skips
+    // geocoding entirely and converts that value directly from the legacy AL
+    // scheme to the current AA scheme (see MGRS.alToAA). Render that outcome
+    // here and return early — the geocoding-based validation branches below
+    // never apply in this case, since there was nothing to geocode.
+    if (convertedMGRS) {
+        document.getElementById('rGeoSource').innerText = 'not used — MGRS present on label';
+        document.getElementById('rowLocalityCorrected').style.display = 'none';
+        document.getElementById('rLocalityUsed').innerHTML =
+            '<span style="color:#8a9a8a;font-style:italic;font-family:Inter,sans-serif">geocoding skipped — MGRS present on label</span>';
+        document.getElementById('rLatLon').innerText   = 'Not calculated — geocoding skipped';
+        document.getElementById('rCalcMGRS').innerText = '—';
+
+        const vCard = document.getElementById('validationCard');
+        if (convertedMGRS === extracted.mgrs_coordinates.toUpperCase().replace(/\s+/g, ' ').trim()) {
+            vCard.innerHTML = `<div class="validation-card pass">
+                <div class="validation-title">Already in AA scheme</div>
+                <div class="validation-body">
+                    The recorded MGRS <strong>${extracted.mgrs_coordinates}</strong> maps to itself under the
+                    AL → AA row-letter shift, so it was already expressed in the current AA scheme.
+                    Geocoding was skipped since coordinates were already present on the label.
+                </div>
+            </div>`;
+        } else {
+            vCard.innerHTML = `<div class="validation-card info">
+                <div class="validation-title">Converted from AL to AA scheme</div>
+                <div class="validation-body">
+                    Recorded MGRS <strong>${extracted.mgrs_coordinates}</strong> was treated as the legacy AL
+                    100&nbsp;km-square lettering scheme and converted directly to the current AA scheme
+                    (<strong>${convertedMGRS}</strong>) — the row letter was shifted 10 places; the column
+                    letter and numeric easting/northing digits were left unchanged.
+                    Geocoding was skipped since coordinates were already present on the label.
+                </div>
+            </div>`;
+        }
+
+        document.getElementById('finalMGRS').innerText = convertedMGRS;
+        document.getElementById('finalNote').innerText  = 'AL → AA scheme conversion (no geocoding performed)';
+        document.getElementById('methodBadge').innerText = method;
+        return;
+    }
 
     // Locality actually used for geocoding — the specific candidate/variant
     // string that produced the successful geocode hit, not just the raw
@@ -1892,55 +1970,68 @@ async function processFile(file) {
     const rawCandidates = extracted.locality_candidates || [];
     resetGeocodeLog(extracted.locality || null, rawCandidates);
 
-    // ── Step 3/4: Geocode using ALL locality candidates ──────────────────────
-    // geocodeCandidates() runs an anchor-aware, exact-before-fuzzy pass across
-    // every candidate the label offered (most specific AND most general, e.g.
-    // both "Gamia Peaks" and "Mount Kenya"). This prevents a vague or garbled
-    // small-feature name from fuzzy-matching an unrelated, distant place ahead
-    // of a clean match on a well-known landmark.
-    setStep('step-spell', 'active');
     const originalLocality = extracted.locality;
     let coords = null;
-
-    if (rawCandidates.length > 0) {
-        try {
-            coords = await geocodeCandidates(rawCandidates);
-        } catch(e) { console.warn('Candidate geocoding failed:', e); }
-    }
-    setStep('step-spell', 'done');
-
-    // ── Step 4b: Spell-check fallback ────────────────────────────────────────
-    // Only reached if NONE of the raw candidates (exact or fuzzy, anchor-
-    // checked) resolved. As a last resort, ask the LLM for a cautious spelling
-    // correction of the top (most specific) candidate, but only accept it if
-    // the corrected spelling itself independently resolves to a real place.
-    setStep('step-geocode', 'active');
-    if (!coords && originalLocality) {
-        const result = await spellCheckLocality(originalLocality);
-        if (result.corrected !== originalLocality) {
-            extracted.locality = result.corrected;
-            console.log(`Locality corrected: "${originalLocality}" → "${extracted.locality}"`);
-        }
-        coords = result.coords;
-    }
-    if (coords && geocodeLog) {
-        geocodeLog.finalLocalityUsed = coords.matchedTerm || geocodeLog.finalLocalityUsed || extracted.locality;
-        geocodeLog.geocodeSource = coords.source;
-        geocodeLog.matchedTerm = coords.matchedTerm || geocodeLog.matchedTerm;
-        geocodeLog.matchTier = coords.matchTier || geocodeLog.matchTier;
-        geocodeLog.lat = coords.lat;
-        geocodeLog.lon = coords.lon;
-    }
-    setStep('step-geocode', coords ? 'done' : '');
-
-    // ── Step 5: Convert to MGRS ───────────────────────────────────────────────
-    setStep('step-convert', 'active');
     let calcMGRS = null;
-    if (coords) {
-        calcMGRS = MGRS.fromLatLon(coords.lat, coords.lon);
-        if (geocodeLog) geocodeLog.mgrs = calcMGRS.full;
+    let convertedMGRS = null;
+
+    if (extracted.mgrs_coordinates) {
+        // ── MGRS already present on the label: convert AL → AA scheme directly ──
+        // Older Kenyan herbarium labels often carry MGRS grid references
+        // computed against legacy, pre-WGS84 ellipsoids (the "AL" 100 km
+        // square lettering scheme). Rather than re-deriving a position via
+        // locality geocoding — which is only ever a proxy for real
+        // coordinates, and unnecessary when a grid reference is already
+        // recorded — we convert the recorded value directly from AL to the
+        // modern AA scheme used by this app's own MGRS.fromLatLon()
+        // calculator and by all current GIS tools/GPS receivers. Geocoding,
+        // spell-checking and coordinate derivation are all skipped entirely
+        // in this path.
+        ['step-spell', 'step-geocode', 'step-convert'].forEach(s => setStep(s, 'done'));
+        convertedMGRS = MGRS.alToAA(extracted.mgrs_coordinates);
+        console.log(`MGRS present on label ("${extracted.mgrs_coordinates}") — skipping geocoding, converting AL → AA scheme directly: ${convertedMGRS}`);
+        if (geocodeLog) {
+            geocodeLog.finalLocalityUsed = '(skipped — MGRS present on label, converted AL→AA instead)';
+        }
+    } else {
+        // ── No MGRS on label: fall back to locality geocoding ───────────────
+        // ── Step 3/4: Geocode using ALL locality candidates ──────────────────
+        setStep('step-spell', 'active');
+        if (rawCandidates.length > 0) {
+            try {
+                coords = await geocodeCandidates(rawCandidates);
+            } catch(e) { console.warn('Candidate geocoding failed:', e); }
+        }
+        setStep('step-spell', 'done');
+
+        // ── Step 4b: Spell-check fallback ────────────────────────────────────
+        setStep('step-geocode', 'active');
+        if (!coords && originalLocality) {
+            const result = await spellCheckLocality(originalLocality);
+            if (result.corrected !== originalLocality) {
+                extracted.locality = result.corrected;
+                console.log(`Locality corrected: "${originalLocality}" → "${extracted.locality}"`);
+            }
+            coords = result.coords;
+        }
+        if (coords && geocodeLog) {
+            geocodeLog.finalLocalityUsed = coords.matchedTerm || geocodeLog.finalLocalityUsed || extracted.locality;
+            geocodeLog.geocodeSource = coords.source;
+            geocodeLog.matchedTerm = coords.matchedTerm || geocodeLog.matchedTerm;
+            geocodeLog.matchTier = coords.matchTier || geocodeLog.matchTier;
+            geocodeLog.lat = coords.lat;
+            geocodeLog.lon = coords.lon;
+        }
+        setStep('step-geocode', coords ? 'done' : '');
+
+        // ── Step 5: Convert to MGRS ───────────────────────────────────────────
+        setStep('step-convert', 'active');
+        if (coords) {
+            calcMGRS = MGRS.fromLatLon(coords.lat, coords.lon);
+            if (geocodeLog) geocodeLog.mgrs = calcMGRS.full;
+        }
+        setStep('step-convert', calcMGRS ? 'done' : '');
     }
-    setStep('step-convert', calcMGRS ? 'done' : '');
 
     // Print the full geocode activity trail for this specimen — list of every
     // name searched, the name that was actually used, any spelling change,
@@ -1952,7 +2043,7 @@ async function processFile(file) {
     setTimeout(() => {
         setStep('step-validate', 'done');
         document.getElementById('progressWrap').style.display = 'none';
-        showResults(extracted, coords, calcMGRS, method, originalLocality);
+        showResults(extracted, coords, calcMGRS, method, originalLocality, convertedMGRS);
     }, 300);
 }
 
