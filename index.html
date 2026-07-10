@@ -690,27 +690,80 @@ async function preprocessForOCR(file) {
     }
 }
 
-// ─── Tesseract OCR helpers (page-segmentation-mode aware) ─────────────────────
+// ─── Tesseract OCR helpers (page-segmentation-mode aware, defensive) ──────────
 // Default Tesseract PSM (page segmentation mode) often fights herbarium label
 // layouts, which mix printed and handwritten text in irregular blocks. PSM 6
 // ("assume a single uniform block of text") generally outperforms the default
 // for full-label reads. A second, sparse-text pass (PSM 11) with a tight
 // character whitelist is used only when hunting for an MGRS-like token — it's
 // tuned for isolated short strings rather than paragraphs.
+//
+// A single worker is created lazily and REUSED across both passes for a given
+// specimen (cheaper than spinning up a new wasm worker per call), then
+// released once processing for that specimen finishes.
+//
+// Some tesseract.js 4.x builds have a known race condition where
+// createWorker() can resolve fractionally before the underlying wasm core is
+// fully attached — calling setParameters() or recognize() in that window
+// throws "Cannot read properties of null (reading 'SetVariable')" from deep
+// inside the library, uncatchable at the call site in the normal case. Every
+// worker interaction here is wrapped so that failure degrades gracefully
+// instead of crashing the pipeline: if the worker path fails for any reason,
+// we drop it and fall back to the simple, well-tested Tesseract.recognize()
+// static call (no PSM/whitelist control, but far more resilient), which is
+// also what this app used before PSM tuning was introduced.
 const TESSERACT_PSM_SINGLE_BLOCK = '6';
 const TESSERACT_PSM_SPARSE_TEXT  = '11';
+const TESSERACT_MGRS_WHITELIST   = '0123456789ABCDEFGHJKLMNPQRSTUVWXYZ';
+
+let ocrWorkerPromise = null;
+
+async function getSharedOCRWorker() {
+    if (!ocrWorkerPromise) {
+        ocrWorkerPromise = Tesseract.createWorker('eng').catch(e => {
+            ocrWorkerPromise = null; // clear so the next call can retry from scratch
+            throw e;
+        });
+    }
+    return ocrWorkerPromise;
+}
+
+// Releases the shared worker, if one exists. Always call this once per
+// specimen (in a `finally`) so a broken/stale worker never bleeds into the
+// next upload. Never throws — cleanup failures are logged, not propagated.
+async function releaseSharedOCRWorker() {
+    if (!ocrWorkerPromise) return;
+    const pending = ocrWorkerPromise;
+    ocrWorkerPromise = null;
+    try {
+        const worker = await pending;
+        await worker.terminate();
+    } catch (e) {
+        console.warn('OCR worker cleanup failed (non-fatal):', e);
+    }
+}
 
 async function runTesseractOCR(imageSource, { psm, whitelist } = {}) {
-    const worker = await Tesseract.createWorker('eng');
     try {
-        const params = {};
-        if (psm) params.tessedit_pageseg_mode = psm;
-        if (whitelist) params.tessedit_char_whitelist = whitelist;
-        if (Object.keys(params).length > 0) await worker.setParameters(params);
+        const worker = await getSharedOCRWorker();
+        try {
+            // Always set both parameters explicitly (whitelist defaults to
+            // '' = unrestricted) so a previous pass's settings never leak
+            // into this one when the worker is being reused.
+            await worker.setParameters({
+                tessedit_pageseg_mode: psm || TESSERACT_PSM_SINGLE_BLOCK,
+                tessedit_char_whitelist: whitelist || ''
+            });
+        } catch (paramErr) {
+            console.warn('Tesseract setParameters failed — continuing with worker defaults:', paramErr);
+        }
         const { data } = await worker.recognize(imageSource);
         return data.text;
-    } finally {
-        await worker.terminate();
+    } catch (e) {
+        console.warn('Tesseract worker OCR pass failed, falling back to Tesseract.recognize():', e);
+        ocrWorkerPromise = null; // the worker may be in a broken state — don't reuse it
+        const { data } = await Tesseract.recognize(imageSource, 'eng');
+        return data.text;
     }
 }
 
@@ -727,7 +780,7 @@ async function runTesseractFullText(imageSource) {
 async function runTesseractMGRSPass(imageSource) {
     return runTesseractOCR(imageSource, {
         psm: TESSERACT_PSM_SPARSE_TEXT,
-        whitelist: '0123456789ABCDEFGHJKLMNPQRSTUVWXYZ'
+        whitelist: TESSERACT_MGRS_WHITELIST
     });
 }
 
@@ -1257,12 +1310,16 @@ function logMGRSCrossValidation(mainValue, rereadValue, ocrValue) {
 // that order; (2) failing that, the first candidate that parses even WITH
 // correction applied. Returns full diagnostic detail so the UI can show
 // exactly what was compared and why a given value won.
-async function crossValidateMGRS(mainValue, base64, mimeType, ocrText) {
+async function crossValidateMGRS(mainValue, base64, mimeType, ocrText, ocrWhitelistText) {
     let rereadValue = null;
     if (base64) {
         rereadValue = await rereadMGRSField(base64, mimeType);
     }
-    const ocrValue = findMGRSInOCRText(ocrText);
+    // Try the full-label OCR text first; if that doesn't turn up an
+    // MGRS-like token, fall back to the narrow whitelist/sparse-text pass
+    // (digits + uppercase letters only), which is tuned to find an isolated
+    // short grid-reference token that a paragraph-oriented scan can miss.
+    const ocrValue = findMGRSInOCRText(ocrText) || findMGRSInOCRText(ocrWhitelistText);
     logMGRSCrossValidation(mainValue, rereadValue, ocrValue);
 
     const candidates = [
@@ -2209,21 +2266,31 @@ async function processFile(file) {
     // If vision already succeeded, this is the FIRST OCR pass for this
     // specimen (a lightweight, local, no-API-cost scan — not a second full
     // Tesseract+LLM extraction). If OCR fallback already ran above, its text
-    // is reused here rather than scanning the image twice.
+    // is reused here rather than scanning the image twice. A second, narrow
+    // whitelist/sparse-text pass is also run (reusing the same worker) to
+    // catch an isolated grid-reference token that the full-text pass misses.
     setStep('step-crosscheck', 'active');
     let crossCheck = null;
     try {
+        const ocrCanvas = await preprocessForOCR(file);
         if (ocrRawText === null) {
-            const ocrCanvas = await preprocessForOCR(file);
             ocrRawText = await runTesseractFullText(ocrCanvas || file);
         }
-        const ocrHasMGRSLikeToken = !!findMGRSInOCRText(ocrRawText);
+        let ocrWhitelistText = null;
+        try {
+            ocrWhitelistText = await runTesseractMGRSPass(ocrCanvas || file);
+        } catch (e) {
+            console.warn('MGRS-focused OCR pass failed (non-fatal, continuing with full-text scan only):', e);
+        }
+
+        const ocrHasMGRSLikeToken = !!(findMGRSInOCRText(ocrRawText) || findMGRSInOCRText(ocrWhitelistText));
         if (extracted.mgrs_coordinates || ocrHasMGRSLikeToken) {
             crossCheck = await crossValidateMGRS(
                 extracted.mgrs_coordinates,
                 visionSucceeded ? base64 : null,
                 'image/jpeg',
-                ocrRawText
+                ocrRawText,
+                ocrWhitelistText
             );
             if (crossCheck.resolved && crossCheck.resolved.value &&
                 crossCheck.resolved.value.toUpperCase().replace(/\s+/g,'') !== (extracted.mgrs_coordinates || '').toUpperCase().replace(/\s+/g,'')) {
@@ -2233,8 +2300,13 @@ async function processFile(file) {
         }
         setStep('step-crosscheck', 'done');
     } catch(e) {
-        console.warn('MGRS cross-check pass failed:', e);
+        console.warn('MGRS cross-check pass failed (continuing without it):', e);
         setStep('step-crosscheck', '');
+    } finally {
+        // Always release the shared OCR worker once cross-checking is done
+        // for this specimen — never let a stale/broken worker linger into
+        // the next upload, and never let cleanup itself throw.
+        await releaseSharedOCRWorker();
     }
 
     // If the label carried an MGRS value, try to parse/convert it (now with
