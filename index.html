@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Plant Specimen MGRS Validator</title>
+    <title>Plant Specimen MGRS Validator — Batch / BRAHMS Export</title>
     <script src="https://cdn.tailwindcss.com"></script>
     <script src="https://cdn.jsdelivr.net/npm/tesseract.js@4/dist/tesseract.min.js"></script>
     <style>
@@ -74,6 +74,18 @@
             margin-left: auto;
         }
         .btn-test:hover { background: #f0f2f0; }
+
+        /* Queue indicator in status bar */
+        .queue-indicator {
+            font-size: 0.75rem;
+            font-family: 'IBM Plex Mono', monospace;
+            color: #8a5a00;
+            background: #fef3e2;
+            padding: 3px 10px;
+            border-radius: 3px;
+            display: none;
+        }
+        .queue-indicator.active { display: inline-block; }
 
         /* Main layout */
         .main { display: grid; grid-template-columns: 1fr 1fr; gap: 0; min-height: calc(100vh - 100px); }
@@ -189,6 +201,22 @@
         .progress-step.done .step-dot { background: #3d9e5e; }
         @keyframes pulse { 0%,100%{ opacity:1 } 50%{ opacity:0.4 } }
 
+        /* Queue list */
+        .queue-list {
+            margin-top: 1.25rem;
+            display: flex;
+            flex-direction: column;
+            gap: 4px;
+        }
+        .queue-list-item {
+            font-size: 0.75rem;
+            font-family: 'IBM Plex Mono', monospace;
+            color: #8a5a00;
+            background: #fef3e2;
+            padding: 4px 10px;
+            border-radius: 4px;
+        }
+
         /* Right panel: results */
         .panel-right {
             padding: 2rem;
@@ -242,6 +270,48 @@
             font-family: 'IBM Plex Mono', monospace;
         }
         .field-val.muted { color: #8a9a8a; font-family: 'Inter', sans-serif; font-style: italic; }
+        .field-val[contenteditable="true"] {
+            cursor: text;
+            outline: none;
+        }
+        .field-val[contenteditable="true"]:hover {
+            background: #fafdf9;
+        }
+        .field-val[contenteditable="true"]:focus {
+            background: #f4faf5;
+            box-shadow: inset 0 0 0 1.5px #3d9e5e;
+        }
+        .editable-hint {
+            font-size: 0.6875rem;
+            color: #8a9a8a;
+            font-family: 'Inter', sans-serif;
+            margin-top: -0.5rem;
+        }
+        .final-mgrs[contenteditable="true"] {
+            cursor: text;
+            outline: none;
+            border-radius: 4px;
+            padding: 2px 4px;
+            margin: -2px -4px;
+        }
+        .final-mgrs[contenteditable="true"]:focus {
+            background: rgba(232,237,232,0.12);
+            box-shadow: inset 0 0 0 1.5px #6b7a6b;
+        }
+        .save-corrections-row {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            margin-top: 0.75rem;
+        }
+        .save-status {
+            font-size: 0.75rem;
+            font-family: 'IBM Plex Mono', monospace;
+            color: #3d9e5e;
+            opacity: 0;
+            transition: opacity 0.2s;
+        }
+        .save-status.show { opacity: 1; }
 
         /* Validation card */
         .validation-card {
@@ -330,10 +400,102 @@
             font-weight: 500;
         }
 
+        /* Batch / specimen table */
+        .batch-section {
+            padding: 2rem;
+            background: #fff;
+            border-top: 1px solid #dde3dd;
+        }
+        .batch-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 1rem;
+            flex-wrap: wrap;
+            gap: 10px;
+        }
+        .batch-actions { display: flex; gap: 10px; }
+        .btn-primary {
+            font-size: 0.8125rem;
+            font-family: 'Inter', sans-serif;
+            padding: 0.5rem 1.1rem;
+            border: none;
+            border-radius: 4px;
+            background: #1a1f1a;
+            color: #e8ede8;
+            cursor: pointer;
+        }
+        .btn-primary:hover { background: #3a453a; }
+        .btn-primary:disabled { background: #c5ccc5; cursor: not-allowed; }
+        .btn-outline {
+            font-size: 0.8125rem;
+            font-family: 'Inter', sans-serif;
+            padding: 0.5rem 1.1rem;
+            border: 1px solid #c5ccc5;
+            border-radius: 4px;
+            background: transparent;
+            color: #3a453a;
+            cursor: pointer;
+        }
+        .btn-outline:hover { background: #f0f2f0; }
+
+        table.specimen-table {
+            width: 100%;
+            border-collapse: collapse;
+            font-size: 0.8125rem;
+        }
+        table.specimen-table th {
+            text-align: left;
+            font-size: 0.6875rem;
+            font-weight: 600;
+            letter-spacing: 0.06em;
+            text-transform: uppercase;
+            color: #8a9a8a;
+            padding: 0.5rem 0.75rem;
+            border-bottom: 1.5px solid #dde3dd;
+        }
+        table.specimen-table td {
+            padding: 0.5rem 0.75rem;
+            border-bottom: 1px solid #eef1ee;
+            vertical-align: middle;
+        }
+        table.specimen-table tr:hover td { background: #fafbfa; }
+        .sp-thumb {
+            width: 44px; height: 44px; object-fit: cover;
+            border-radius: 4px; border: 1px solid #dde3dd;
+            display: block;
+        }
+        .sp-species { font-style: italic; color: #1a1f1a; }
+        .sp-mgrs { font-family: 'IBM Plex Mono', monospace; font-size: 0.78rem; }
+        .sp-empty-cell { color: #b8c4b8; font-style: italic; }
+        .row-actions { display: flex; gap: 6px; }
+        .row-btn {
+            font-size: 0.7rem;
+            font-family: 'IBM Plex Mono', monospace;
+            border: 1px solid #c5ccc5;
+            background: transparent;
+            border-radius: 3px;
+            padding: 2px 7px;
+            cursor: pointer;
+            color: #3a453a;
+        }
+        .row-btn:hover { background: #f0f2f0; }
+        .row-btn.danger { color: #a83232; border-color: #e2b8b8; }
+        .row-btn.danger:hover { background: #fdf3f2; }
+        .batch-empty {
+            padding: 2rem;
+            text-align: center;
+            color: #b8c4b8;
+            font-size: 0.8125rem;
+            border: 1px dashed #dde3dd;
+            border-radius: 8px;
+        }
+
         @media (max-width: 768px) {
             .main { grid-template-columns: 1fr; }
             .panel-left { border-right: none; border-bottom: 1px solid #dde3dd; }
             .coords-row { grid-template-columns: 1fr; }
+            table.specimen-table { font-size: 0.72rem; }
         }
     </style>
 </head>
@@ -341,26 +503,27 @@
 
 <header class="app-header">
     <h1>MGRS Validator</h1>
-    <span class="subtitle">herbarium specimen · coordinate verification</span>
+    <span class="subtitle">herbarium specimen · coordinate verification · batch + BRAHMS export</span>
 </header>
 
 <div class="status-bar">
     <div class="status-dot" id="statusDot"></div>
     <span class="status-label" id="statusLabel">Backend not tested</span>
+    <span class="queue-indicator" id="queueIndicator"></span>
     <button class="btn-test" id="testBtn">Test connection</button>
 </div>
 
 <div class="main">
     <!-- LEFT: Upload + progress -->
     <div class="panel-left">
-        <div class="panel-label">Specimen image</div>
+        <div class="panel-label">Specimen image(s)</div>
 
         <div class="drop-zone" id="dropZone">
-            <input type="file" id="fileInput" accept="image/*" style="display:none">
+            <input type="file" id="fileInput" accept="image/*" multiple style="display:none">
             <div class="drop-icon">↑</div>
             <div class="drop-text">
-                <strong>Click to select</strong> or drag a photo here<br>
-                JPG, PNG, TIFF — herbarium label visible
+                <strong>Click to select</strong> or drag one or more photos here<br>
+                JPG, PNG, TIFF — herbarium label visible. Multiple sheets are queued and processed one at a time.
             </div>
         </div>
 
@@ -369,6 +532,8 @@
             <span class="preview-badge" id="methodBadge">—</span>
             <button class="btn-clear" id="clearBtn" title="Clear image">✕</button>
         </div>
+
+        <div class="queue-list" id="queueList"></div>
 
         <div class="progress-wrap" id="progressWrap">
             <div class="progress-steps" id="progressSteps">
@@ -404,7 +569,7 @@
         </div>
     </div>
 
-    <!-- RIGHT: Results -->
+    <!-- RIGHT: Results (shows the specimen currently processing, or whichever was clicked "View" in the table below) -->
     <div class="panel-right">
         <div class="empty-state" id="emptyState">
             <div class="empty-icon">◻</div>
@@ -414,23 +579,23 @@
         <div class="result-section" id="resultsAll">
 
             <div>
-                <div class="panel-label">Extracted data</div>
+                <div class="panel-label">Extracted data <span style="text-transform:none;letter-spacing:normal;color:#b8c4b8;">— click any value to correct it, especially for handwritten labels</span></div>
                 <div class="field-group">
                     <div class="field-row">
                         <div class="field-key">Species</div>
-                        <div class="field-val" id="rSpecies">—</div>
+                        <div class="field-val" id="rSpecies" contenteditable="true" spellcheck="false">—</div>
                     </div>
                     <div class="field-row">
                         <div class="field-key">Author citation</div>
-                        <div class="field-val" id="rAuthor">—</div>
+                        <div class="field-val" id="rAuthor" contenteditable="true" spellcheck="false">—</div>
                     </div>
                     <div class="field-row">
                         <div class="field-key">Recorded MGRS</div>
                         <div class="field-val" id="rMGRS">—</div>
                     </div>
                     <div class="field-row">
-                        <div class="field-key">Locality (raw)</div>
-                        <div class="field-val" id="rLocality">—</div>
+                        <div class="field-key">Locality</div>
+                        <div class="field-val" id="rLocality" contenteditable="true" spellcheck="false">—</div>
                     </div>
                     <div class="field-row" id="rowLocalityCorrected" style="display:none">
                         <div class="field-key">Locality (corrected)</div>
@@ -442,11 +607,15 @@
                     </div>
                     <div class="field-row">
                         <div class="field-key">Collector</div>
-                        <div class="field-val" id="rCollector">—</div>
+                        <div class="field-val" id="rCollector" contenteditable="true" spellcheck="false">—</div>
+                    </div>
+                    <div class="field-row">
+                        <div class="field-key">Field Number</div>
+                        <div class="field-val" id="rFieldNumber" contenteditable="true" spellcheck="false">—</div>
                     </div>
                     <div class="field-row">
                         <div class="field-key">Date</div>
-                        <div class="field-val" id="rDate">—</div>
+                        <div class="field-val" id="rDate" contenteditable="true" spellcheck="false">—</div>
                     </div>
                     <div class="field-row">
                         <div class="field-key">Extraction via</div>
@@ -476,6 +645,10 @@
                         <div class="coord-card-val" id="rCalcMGRS">—</div>
                     </div>
                 </div>
+                <div class="save-corrections-row">
+                    <button class="btn-outline" id="regeocodeBtn">Re-geocode from corrected locality</button>
+                    <span class="save-status" id="regeocodeStatus">✓ updated</span>
+                </div>
             </div>
 
             <div>
@@ -485,11 +658,45 @@
 
             <div class="final-block mt-3">
                 <div class="final-label">Corrected MGRS</div>
-                <div class="final-mgrs" id="finalMGRS">—</div>
+                <div class="final-mgrs" id="finalMGRS" contenteditable="true" spellcheck="false">—</div>
                 <div class="final-note mt-3" id="finalNote">—</div>
+                <div class="save-corrections-row">
+                    <button class="btn-outline" id="saveCorrectionsBtn" style="background:#e8ede8;">Save corrections to this specimen</button>
+                    <span class="save-status" id="saveStatus">✓ saved</span>
+                </div>
             </div>
 
         </div>
+    </div>
+</div>
+
+<!-- BATCH: processed specimens + BRAHMS export -->
+<div class="batch-section">
+    <div class="batch-header">
+        <div class="panel-label" style="margin-bottom:0;">Processed specimens (<span id="specimenCount">0</span>)</div>
+        <div class="batch-actions">
+            <button class="btn-outline" id="clearAllBtn">Clear all</button>
+            <button class="btn-primary" id="exportCsvBtn">Export BRAHMS CSV</button>
+        </div>
+    </div>
+    <div id="batchTableWrap">
+        <div class="batch-empty" id="batchEmpty">No specimens processed yet — results will appear here as each upload finishes.</div>
+        <table class="specimen-table" id="specimenTable" style="display:none;">
+            <thead>
+                <tr>
+                    <th></th>
+                    <th>Species</th>
+                    <th>Final MGRS</th>
+                    <th>Source</th>
+                    <th>Locality</th>
+                    <th>Date</th>
+                    <th>Collector</th>
+                    <th>Field #</th>
+                    <th></th>
+                </tr>
+            </thead>
+            <tbody id="specimenTableBody"></tbody>
+        </table>
     </div>
 </div>
 
@@ -930,22 +1137,6 @@ const MGRS = {
 
 <script>
 // ─── Scientific name / author citation splitter ───────────────────────────────
-// Herbarium labels and vision/OCR extraction commonly return the species name
-// and its author citation as one combined string, e.g. "Uvaria lucida Benth."
-// Botanically, the "species name" is just the genus + specific (and, where
-// present, infraspecific) epithet — "Uvaria lucida" — while "Benth." is the
-// author citation and belongs in its own field. This is a deterministic,
-// code-level safety net (the extraction prompts also ask the model to
-// separate these directly, but we never rely on that alone, exactly like the
-// locality-candidate cleanup above).
-//
-// Approach: epithets in a scientific name are always lowercase (genus is
-// capitalized, but only the FIRST word). An author citation begins as soon as
-// we hit a token that is not a lowercase epithet/rank-abbreviation word — i.e.
-// a capitalized author abbreviation ("Benth.", "R.Br."), a parenthesis
-// (basionym author, e.g. "(Vahl) Benth."), or a connector like "ex"/"&" that
-// precedes one. Infraspecific rank markers ("var.", "subsp.", "ssp.", "f.",
-// "forma", "cv.") are lowercase and are kept as part of the species name.
 function splitScientificName(fullName) {
     if (!fullName || typeof fullName !== 'string') return { species: null, author: null };
     const trimmed = fullName.trim().replace(/\s+/g, ' ');
@@ -955,18 +1146,11 @@ function splitScientificName(fullName) {
     const speciesTokens = [];
     let i = 0;
 
-    // First token is always the genus — capitalized, kept unconditionally.
     if (tokens.length > 0) {
         speciesTokens.push(tokens[0]);
         i = 1;
     }
 
-    // A token is part of the species/infraspecific epithet if it is entirely
-    // lowercase letters (allowing hyphens, apostrophes and a trailing period
-    // for rank abbreviations like "var." or "f."). The moment we hit a token
-    // that doesn't match — capitalized, a parenthesis, an ampersand, a
-    // standalone "ex"/"in" connector before a capitalized author — the
-    // species name is complete and everything remaining is author citation.
     const EPITHET_RE = /^[a-z\u00E0-\u017F][a-z\u00E0-\u017F'-]*\.?$/;
 
     while (i < tokens.length) {
@@ -1000,8 +1184,6 @@ async function callAPI(model, messages) {
     return data.choices[0].message.content;
 }
 
-// Step 1: ask the LLM for spelling correction, but treat it as a SUGGESTION only.
-// We never trust this blindly — it gets verified against GeoNames before use.
 async function suggestSpellingCorrection(locality) {
     if (!locality) return locality;
     const prompt = `You are a Kenyan geography expert reviewing OCR/vision output from a herbarium label. The text may contain a minor OCR misread of a place name.
@@ -1031,8 +1213,6 @@ Return ONLY the (possibly corrected) locality string, no explanation, no quotes.
     }
 }
 
-// Step 2: verify a candidate locality string actually resolves to a real place
-// in Kenya via GeoNames/Nominatim. Returns the geocode result if found, else null.
 async function verifyLocalityResolves(locality) {
     const variants = extractLocalityVariants(locality);
     for (const variant of variants) {
@@ -1044,16 +1224,9 @@ async function verifyLocalityResolves(locality) {
     return null;
 }
 
-// Main entry point: tries the ORIGINAL locality first. Only falls back to the
-// LLM's spelling suggestion if the original fails to geocode AND the suggestion
-// is different AND the suggestion itself successfully geocodes.
-// This guarantees we never "correct" a name that was already right, and never
-// accept a correction that doesn't actually resolve to a real place.
 async function spellCheckLocality(locality) {
     if (!locality) return { corrected: locality, coords: null };
 
-    // 1. Try the original as-extracted first — it may already be correct
-    //    (as in the Lolgorien case, where vision read it correctly).
     const originalMatch = await verifyLocalityResolves(locality);
     if (originalMatch) {
         console.log(`Original locality "${locality}" resolved directly — no correction needed`);
@@ -1064,16 +1237,11 @@ async function spellCheckLocality(locality) {
         return { corrected: locality, coords: originalMatch };
     }
 
-    // 2. Original didn't resolve — ask the LLM for a cautious suggestion
     const suggestion = await suggestSpellingCorrection(locality);
     if (suggestion === locality) {
-        // LLM agreed there's nothing to change, and original didn't resolve.
-        // Try original variants again via geocode() in the main pipeline —
-        // it has broader fallback logic than verifyLocalityResolves.
         return { corrected: locality, coords: null };
     }
 
-    // 3. LLM proposed a different spelling — verify IT resolves before trusting it
     const suggestionMatch = await verifyLocalityResolves(suggestion);
     if (suggestionMatch) {
         console.log(`Locality corrected: "${locality}" → "${suggestion}" (verified via ${suggestionMatch.source})`);
@@ -1084,9 +1252,6 @@ async function spellCheckLocality(locality) {
         return { corrected: suggestion, coords: suggestionMatch };
     }
 
-    // 4. Suggestion also failed to resolve — keep the original rather than
-    //    introduce an unverified guess. Let the main geocode() pipeline make
-    //    one more broad attempt on the original.
     console.warn(`LLM suggestion "${suggestion}" did not resolve either — keeping original "${locality}"`);
     return { corrected: locality, coords: null };
 }
@@ -1102,11 +1267,15 @@ Extract and return ONLY valid JSON with these fields:
   "mgrs_coordinates": "MGRS string exactly as written on the label, or null if not present",
   "locality_candidates": ["ordered array of every place name mentioned on the label, MOST SPECIFIC FIRST, MOST GENERAL LAST"],
   "collection_date": "date as written or null",
-  "collector": "collector name(s) or null"
+  "collector": "collector name(s) ONLY — do not include any number, e.g. 'D.A.K. Wamukoya' not 'D.A.K. Wamukoya No. 140' — or null",
+  "field_number": "the collector's specimen/field number, digits (and an optional trailing letter for split sheets, e.g. '140' or '13880a') — or null if none is visible"
 }
 
-IMPORTANT RULES FOR species_name / author_citation:
-- The label typically reads the scientific name and its author together, e.g. "Uvaria lucida Benth." — you MUST split these into two separate fields.
+IMPORTANT RULES FOR collector / field_number:
+- These are ALWAYS two separate fields, even when the label prints them right next to each other (e.g. "P. Kuchar 13880" → collector: "P. Kuchar", field_number: "13880").
+- The field number is FREQUENTLY printed as its own separate labeled field elsewhere on the form — look for "No.", "Field No.", "Collector No.", "Specimen No.", or a bare number near (but not necessarily touching) the collector's name or the date. It does NOT have to be physically adjacent to the collector's name to belong to this field — scan the whole label for it.
+- Never merge the number back into the collector field. collector must contain ONLY the person's name.
+- If you cannot find a number anywhere on the label, set field_number to null — do not guess or reuse an unrelated number (e.g. a sheet/barcode number in a corner is NOT the field number unless it's explicitly labeled as the collector's number).
 - species_name is ONLY the genus and specific epithet (and infraspecific rank + epithet if present, e.g. "var. kirkii"). NEVER include the author's name/abbreviation in species_name.
 - author_citation is everything that names the author(s) who published the name — abbreviated surnames, initials, "ex", "&", or parenthetical basionym authors (e.g. "Benth.", "R.Br.", "(Vahl) Benth.", "Baker f."). This is NOT part of the species name itself.
 - Example: label text "Uvaria lucida Benth." → species_name: "Uvaria lucida", author_citation: "Benth."
@@ -1148,11 +1317,15 @@ async function textExtract(ocrText) {
   "mgrs_coordinates": "MGRS string exactly as written, or null if not present",
   "locality_candidates": ["ordered array of every place name found in the text, MOST SPECIFIC FIRST, MOST GENERAL LAST"],
   "collection_date": "date as written or null",
-  "collector": "collector name(s) or null"
+  "collector": "collector name(s) ONLY — do not include any number, e.g. 'D.A.K. Wamukoya' not 'D.A.K. Wamukoya No. 140' — or null",
+  "field_number": "the collector's specimen/field number, digits (and an optional trailing letter for split sheets, e.g. '140' or '13880a') — or null if none is visible"
 }
 
-IMPORTANT RULES FOR species_name / author_citation:
-- OCR text typically reads the scientific name and its author together, e.g. "Uvaria lucida Benth." — you MUST split these into two separate fields.
+IMPORTANT RULES FOR collector / field_number:
+- These are ALWAYS two separate fields, even when the text has them right next to each other (e.g. "P. Kuchar 13880" → collector: "P. Kuchar", field_number: "13880").
+- The field number is FREQUENTLY printed as its own separate labeled field elsewhere on the form — look for "No.", "Field No.", "Collector No.", "Specimen No.", or a bare number near (but not necessarily touching) the collector's name or the date. It does NOT have to be directly adjacent to the collector's name — scan the full text for it.
+- Never merge the number back into the collector field. collector must contain ONLY the person's name.
+- If you cannot find a number anywhere in the text, set field_number to null — do not guess or reuse an unrelated number (e.g. a sheet/barcode number is NOT the field number unless it's explicitly labeled as the collector's number).
 - species_name is ONLY the genus and specific epithet (and infraspecific rank + epithet if present, e.g. "var. kirkii"). NEVER include the author's name/abbreviation in species_name.
 - author_citation is everything that names the author(s) who published the name — abbreviated surnames, initials, "ex", "&", or parenthetical basionym authors (e.g. "Benth.", "R.Br.", "(Vahl) Benth.", "Baker f."). This is NOT part of the species name itself.
 - Example: text "Uvaria lucida Benth." → species_name: "Uvaria lucida", author_citation: "Benth."
@@ -1182,19 +1355,6 @@ ${ocrText}`;
     return normalizeExtracted(JSON.parse(match ? match[0] : '{}'));
 }
 
-// ─── MGRS field cross-validation (narrow vision re-read + OCR scan) ───────────
-// The MGRS/coordinate field is the single most consequential extraction — one
-// misread character can produce a completely wrong 100km square, which is
-// exactly what happened with "37MCKD182". Rather than trusting whichever
-// method produced a value first, when a candidate MGRS-like string exists we
-// re-read it with a second, narrowly-scoped pass and cross-check it against
-// an independent OCR scan, then log any disagreement so it's visible.
-
-// A second, deliberately narrow vision prompt that looks ONLY at the
-// coordinate text and is explicitly told not to "clean up" what it reads.
-// This catches cases where the main, do-everything-at-once extraction pass
-// pattern-matches a garbled character to something that "looks right"
-// instead of reporting what's actually printed.
 async function rereadMGRSField(base64, mimeType) {
     const prompt = `Look ONLY at the coordinate/grid-reference text on this herbarium label (it may be labeled "MGRS", "UTM", "Grid Ref", or simply appear as a code like "37M BK 4042 1234").
 
@@ -1219,17 +1379,12 @@ Return ONLY the raw string you read, no explanation, no quotes. If there is no s
     }
 }
 
-// Scans free-form OCR text for an MGRS-like token, tolerant of confusable
-// characters in the numeric portion (letters that commonly stand in for
-// digits — see MGRS.CONFUSABLE_TO_DIGIT), so it can spot e.g. "37MCKD182" or
-// "37M CK 0182" even before any correction is applied.
 function findMGRSInOCRText(ocrText) {
     if (!ocrText) return null;
     const clean = ocrText.toUpperCase();
     const re = /(\d{1,2}\s?[C-XY]\s?[A-HJ-NP-Z]{2}\s?[0-9OQDILBSZGT]{4,12})/g;
     const matches = [...clean.matchAll(re)];
     if (matches.length === 0) return null;
-    // Prefer the longest match — the most complete-looking grid reference.
     matches.sort((a, b) => b[0].length - a[0].length);
     return matches[0][0].replace(/\s+/g, ' ').trim();
 }
@@ -1249,14 +1404,6 @@ function logMGRSCrossValidation(mainValue, rereadValue, ocrValue) {
     console.log('%c──────────────────────────────────────────────────────', 'color:#4a7fc1;font-weight:bold');
 }
 
-// Runs the full cross-validation: narrow vision re-read (if a base64 image is
-// available) + OCR regex scan (if OCR text is available), compares them
-// against the main extraction's value, and resolves a single "best" MGRS
-// candidate — preferring, in order: (1) a value that parses cleanly with NO
-// character-confusion correction needed, trying main → reread → ocr-scan in
-// that order; (2) failing that, the first candidate that parses even WITH
-// correction applied. Returns full diagnostic detail so the UI can show
-// exactly what was compared and why a given value won.
 async function crossValidateMGRS(mainValue, base64, mimeType, ocrText) {
     let rereadValue = null;
     if (base64) {
@@ -1287,20 +1434,6 @@ async function crossValidateMGRS(mainValue, base64, mimeType, ocrText) {
     return { mainValue, rereadValue, ocrValue, resolved, agreement, candidates };
 }
 
-// Normalizes the LLM's extraction output so the rest of the pipeline can rely
-// on a consistent shape: always a `locality_candidates` array (never a bare
-// `locality` string), de-duplicated and trimmed. Keeps backward compatibility
-// in case a model still returns the older singular `locality` field.
-
-// Words that are too generic/administrative to ever be useful as a locality
-// search term or anchor candidate. These are country names, very broad
-// region words, and similar boilerplate that sometimes gets pulled out of
-// label text (e.g. a "Kenya" fragment from a country field or MGRS zone
-// annotation) but is never itself a geocodable place. Critically, allowing
-// a word like this through previously caused it to falsely match against
-// KNOWN_ANCHORS entries that merely contain it as a substring (e.g. "Kenya"
-// inside "Mount Kenya"), forming a bogus anchor that rejected genuinely
-// correct, more specific matches found elsewhere on the same label.
 const LOCALITY_STOPLIST = new Set([
     'kenya', 'east africa', 'africa', 'republic of kenya'
 ]);
@@ -1312,26 +1445,6 @@ function isStoplistedCandidate(candidate) {
 </script>
 
 <script>
-// ── Descriptive-sentence / non-locality fragment detection ───────────────────
-// Despite explicit prompt instructions to extract only place names (not full
-// sentences), the extraction model can still occasionally return a
-// descriptive fragment like "small hill at the western side of Ngong hills"
-// alongside genuinely correct candidates like "Ngong hills" and "Ngong".
-// Sending a fragment like that to a geocoder is actively dangerous: splitting
-// it into "variants" can produce a single leading word (e.g. "small") that
-// is itself a real, unrelated place name somewhere else entirely, which then
-// wins an exact match and silently produces a wrong, confident-looking
-// result. This is a deterministic, code-level safety net — it does not rely
-// on the LLM following formatting instructions correctly.
-//
-// Common relational/descriptive words that signal "this is prose describing
-// a location" rather than "this is the location's name". A candidate
-// containing any of these as a standalone word (word-boundary matched) is
-// treated as a descriptive fragment, not a locality, UNLESS the candidate is
-// short enough that the word is plausibly part of an actual compound place
-// name (e.g. very few real Kenyan place names contain "western", but we
-// still guard with a length check rather than rejecting on word-presence
-// alone, in case of legitimate exceptions).
 const DESCRIPTIVE_FRAGMENT_WORDS = new Set([
     'at', 'the', 'of', 'between', 'side', 'sides', 'western', 'eastern',
     'northern', 'southern', 'small', 'large', 'big', 'near', 'on', 'in',
@@ -1340,14 +1453,6 @@ const DESCRIPTIVE_FRAGMENT_WORDS = new Set([
     'within', 'along', 'towards', 'from', 'to', 'and', 'with'
 ]);
 
-// A candidate is treated as a descriptive fragment (not a real locality) if:
-//   - it has more than 5 words (real place names are almost always 1-3
-//     words, occasionally 4 for compound names like "Ridge between Naro
-//     Moru Streams" — but a genuine 6+ word string is almost always prose), OR
-//   - it contains 2 or more of the descriptive/relational words above as
-//     standalone words. A single descriptive word might still be part of a
-//     real compound name in rare cases, but two or more is a strong signal
-//     of a full descriptive sentence rather than a name.
 function isDescriptiveFragment(candidate) {
     const words = candidate.trim().split(/\s+/).filter(Boolean);
     if (words.length > 5) return true;
@@ -1377,7 +1482,6 @@ function normalizeExtracted(extracted) {
             }
             return true;
         });
-    // de-duplicate while preserving order
     const seen = new Set();
     candidates = candidates.filter(c => {
         const k = c.toLowerCase();
@@ -1386,17 +1490,8 @@ function normalizeExtracted(extracted) {
         return true;
     });
     extracted.locality_candidates = candidates;
-    // Keep `locality` populated as the top (most specific) candidate for any
-    // older code paths / UI fields that still read a singular value.
     extracted.locality = candidates.length > 0 ? candidates[0] : null;
 
-    // ── Species name / author citation split ────────────────────────────────
-    // Even though the extraction prompt now asks the model to return these as
-    // two separate fields, we never rely on prompt-following alone (same
-    // philosophy as the locality-candidate cleanup above). If the model still
-    // returns a combined string in species_name (e.g. "Uvaria lucida Benth."),
-    // or returns author_citation as null while it's actually embedded in
-    // species_name, this deterministically splits them apart.
     const rawSpecies = typeof extracted.species_name === 'string' ? extracted.species_name.trim() : null;
     const llmAuthor = typeof extracted.author_citation === 'string' && extracted.author_citation.trim().length > 0
         ? extracted.author_citation.trim()
@@ -1405,22 +1500,42 @@ function normalizeExtracted(extracted) {
     if (rawSpecies) {
         const { species, author } = splitScientificName(rawSpecies);
         extracted.species_name = species;
-        // Prefer whatever the LLM already isolated correctly; otherwise fall
-        // back to what our deterministic splitter pulled off the combined string.
         extracted.author_citation = llmAuthor || author || null;
     } else {
         extracted.species_name = null;
         extracted.author_citation = llmAuthor;
     }
 
+    // ── Collector / field number split (deterministic safety net) ───────────
+    // Same philosophy as the species/author split above: even though the
+    // prompt now asks the model to return these as two separate fields, we
+    // never rely on prompt-following alone. If the model still leaves a
+    // trailing number attached to `collector` (e.g. "P. Kuchar 13880"), or
+    // returns field_number as null while a number is visibly embedded in
+    // collector, this deterministically separates them. If the model DID
+    // return a clean field_number (e.g. read from a separate "No." field
+    // elsewhere on the label — the case that previously went unextracted
+    // entirely), that value is always preferred over anything parsed out of
+    // the collector string.
+    const rawCollector = typeof extracted.collector === 'string' ? extracted.collector.trim() : null;
+    const llmFieldNumber = (extracted.field_number !== null && extracted.field_number !== undefined)
+        ? String(extracted.field_number).trim()
+        : '';
+
+    if (rawCollector) {
+        const split = splitCollectorFieldNumber(rawCollector);
+        extracted.collector = split.name || rawCollector;
+        extracted.field_number = llmFieldNumber || split.fieldNumber || null;
+    } else {
+        extracted.collector = null;
+        extracted.field_number = llmFieldNumber || null;
+    }
+
     return extracted;
 }
 
-// ─── Geocoding config ─────────────────────────────────────────────────────────
-
 const GEONAMES_USER = 'davy254';
 
-// Kenya bounding box (WGS84)
 const KENYA_BOUNDS = { minLat: -4.7, maxLat: 5.0, minLon: 33.9, maxLon: 41.9 };
 
 function isInKenya(lat, lon) {
@@ -1428,26 +1543,6 @@ function isInKenya(lat, lon) {
            lon >= KENYA_BOUNDS.minLon && lon <= KENYA_BOUNDS.maxLon;
 }
 
-// ── Administrative disambiguation hints ────────────────────────────────────────
-// Kenya's 47 counties (current devolved-government names). Older labels often
-// say "District" instead of "County" (pre-2010 administrative units), but the
-// county name itself is usually still the recognizable part (e.g. "Narok
-// District" → county "Narok"). This list is used to detect when a candidate
-// is naming an administrative area rather than a specific locality, so it can
-// be used as a DISAMBIGUATION HINT rather than a search term in its own right.
-//
-// Some Kenyan place names are genuinely ambiguous — they refer to two or more
-// distinct, unrelated real features. The clearest example is "Ewaso Nyiro"
-// (also spelled "Ewaso Ng'iro"), which names BOTH a ~700km river rising on
-// Mount Kenya and flowing through Laikipia/Samburu/Isiolo into the Lorian
-// Swamp, AND a separate, much shorter river rising in the Mau Forest and
-// flowing through Narok County into Lake Natron. A bare GeoNames/Nominatim
-// lookup for "Ewaso Nyiro" will return both (and possibly more variants), and
-// without secondary context there is no principled way to know which one a
-// given herbarium label means — but herbarium labels often DO carry that
-// context, in the form of a district/county name recorded elsewhere on the
-// same label (e.g. "Narok District"). When that's available, it should be
-// used to pick between otherwise-equally-valid results sharing the same name.
 const KENYA_COUNTIES = new Set([
     'mombasa', 'kwale', 'kilifi', 'tana river', 'lamu', 'taita taveta',
     'garissa', 'wajir', 'mandera', 'marsabit', 'isiolo', 'meru',
@@ -1460,9 +1555,6 @@ const KENYA_COUNTIES = new Set([
     'kisii', 'nyamira', 'nairobi'
 ]);
 
-// Strips common district/county/region suffix words and normalizes case, so
-// "Narok District" and "Narok County" both reduce to "narok" for matching
-// against KENYA_COUNTIES and against a GeoNames result's adminName1 field.
 function normalizeAdminName(s) {
     return s.toLowerCase()
         .replace(/\bdistrict\b/g, '')
@@ -1473,12 +1565,6 @@ function normalizeAdminName(s) {
         .trim();
 }
 
-// Scans the full candidate list for anything that names a Kenyan county or
-// district (e.g. "Narok District", "Isiolo County", or a bare "Narok"), and
-// returns the normalized county names found. These are returned separately
-// from locality search terms — a district/county name on its own is too
-// broad to usefully geocode as "the" locality, but it's valuable as a
-// disambiguation hint when a DIFFERENT candidate's name is ambiguous.
 function extractDisambiguationHints(candidates) {
     const hints = [];
     for (const candidate of candidates) {
@@ -1488,7 +1574,6 @@ function extractDisambiguationHints(candidates) {
     return hints;
 }
 
-// ── Distance helper (Haversine, km) ───────────────────────────────────────────
 function haversineKm(lat1, lon1, lat2, lon2) {
     const R = 6371;
     const dLat = (lat2 - lat1) * Math.PI / 180;
@@ -1498,7 +1583,6 @@ function haversineKm(lat1, lon1, lat2, lon2) {
     return 2 * R * Math.asin(Math.sqrt(a));
 }
 
-// ── Known landmark anchors ────────────────────────────────────────────────────
 const KNOWN_ANCHORS = [
     { names: ['mount kenya', 'mt kenya', 'mt. kenya'], lat: -0.1521, lon: 37.3084, radiusKm: 60 },
     { names: ['mount elgon', 'mt elgon', 'mt. elgon'], lat: 1.1349, lon: 34.5582, radiusKm: 50 },
@@ -1538,7 +1622,7 @@ function candidateMatchesAnchorName(norm, n) {
 }
 
 function findKnownAnchor(candidates) {
-    let best = null; // { candidate, anchor }
+    let best = null;
     for (const candidate of candidates) {
         const norm = normalizeForAnchorMatch(candidate);
         if (norm.length < 4) continue;
@@ -1553,7 +1637,6 @@ function findKnownAnchor(candidates) {
     return best;
 }
 
-// ── Strategy 1: GeoNames ──────────────────────────────────────────────────────
 function levenshtein(a, b) {
     a = a.toLowerCase(); b = b.toLowerCase();
     const dp = Array.from({length: a.length + 1}, (_, i) => [i, ...Array(b.length).fill(0)]);
@@ -1961,12 +2044,11 @@ function showResults(extracted, coords, calcMGRS, method, originalLocality, conv
         ? candidateList.join('  →  ')
         : (originalLocality || extracted.locality || '—');
     document.getElementById('rCollector').innerText = extracted.collector || '—';
+    document.getElementById('rFieldNumber').innerText = extracted.field_number || '—';
     document.getElementById('rDate').innerText      = extracted.collection_date || '—';
     document.getElementById('rMethod').innerText    = method;
     document.getElementById('rGeoSource').innerText = coords ? coords.source : '—';
 
-    // ── MGRS already present on the label AND successfully parsed: AL → AA
-    // scheme conversion path ─────────────────────────────────────────────
     if (convertedMGRS && convertedMGRS.full) {
         document.getElementById('rGeoSource').innerText = 'not used — MGRS present on label';
         document.getElementById('rowLocalityCorrected').style.display = 'none';
@@ -2137,8 +2219,376 @@ function showResults(extracted, coords, calcMGRS, method, originalLocality, conv
 </script>
 
 <script>
+// ─── Batch registry (NEW): stores one record per processed specimen so the
+// table below can list every upload, "View" can restore any of them into the
+// results panel without reprocessing, and Export can build a BRAHMS CSV
+// across the whole batch. Nothing in this block touches the extraction,
+// geocoding, or MGRS logic above — it only reads the DOM/variables after
+// showResults() has already populated them for the specimen currently being
+// processed. ────────────────────────────────────────────────────────────────
+let allSpecimens = [];
+let specimenCounter = 0;
+let currentSpecimenId = null; // which specimen's data is currently shown in the results panel
+
+function registerSpecimen(thumbSrc, extracted, coords, calcMGRS, convertedMGRS, method) {
+    const id = 'sp_' + (++specimenCounter);
+    const record = {
+        id,
+        thumb: thumbSrc,
+        species: extracted.species_name || '',
+        author: extracted.author_citation || '',
+        family: '', // not currently extracted by the vision/OCR prompts — left blank for manual fill in BRAHMS
+        collector: extracted.collector || '',
+        fieldNumber: extracted.field_number || '',
+        date: extracted.collection_date || '',
+        localityRaw: (extracted.locality_candidates || []).join(' / ') || extracted.locality || '',
+        localityUsed: coords ? (coords.matchedTerm || extracted.locality || '') : '',
+        geoSource: coords ? coords.source
+                  : (convertedMGRS && convertedMGRS.full ? 'label MGRS (AL→AA converted)'
+                  : (extracted.mgrs_coordinates ? 'label MGRS' : '')),
+        lat: coords ? coords.lat : null,
+        lon: coords ? coords.lon : null,
+        recordedMGRS: extracted.mgrs_coordinates || '',
+        finalMGRS: document.getElementById('finalMGRS').innerText,
+        finalNote: document.getElementById('finalNote').innerText,
+        method: method,
+        // Full snapshot of the rendered results panel, so "View" can restore
+        // exactly what was shown (validation card, cross-check card, colors,
+        // etc.) without re-running any extraction or geocoding.
+        snapshotHTML: document.getElementById('resultsAll').innerHTML,
+        snapshotBadge: document.getElementById('methodBadge').innerText
+    };
+    allSpecimens.push(record);
+    currentSpecimenId = id;
+    renderSpecimenTable();
+}
+
+function viewSpecimen(id) {
+    const record = allSpecimens.find(s => s.id === id);
+    if (!record) return;
+    document.getElementById('emptyState').style.display = 'none';
+    document.getElementById('resultsAll').innerHTML = record.snapshotHTML;
+    document.getElementById('resultsAll').classList.add('visible');
+    document.getElementById('imagePreview').src = record.thumb;
+    document.getElementById('previewWrap').style.display = 'block';
+    document.getElementById('methodBadge').innerText = record.snapshotBadge;
+    currentSpecimenId = id;
+    wireSaveCorrectionsButton();
+    window.scrollTo({ top: 0, behavior: 'smooth' });
+}
+
+// ── Manual correction ────────────────────────────────────────────────────────
+// The Species/Author/Locality/Collector/Date fields and the final MGRS value
+// are contenteditable directly in the results panel (see the field-val and
+// final-mgrs elements). Nothing auto-saves on edit — that would silently
+// rewrite the record on every keystroke/blur, which is risky for data headed
+// into BRAHMS. Instead, edits are only committed to allSpecimens (and to the
+// specimen's cached snapshot, so "View" reflects the correction later) when
+// this button is explicitly clicked.
+function saveCorrections() {
+    if (!currentSpecimenId) return;
+    const record = allSpecimens.find(s => s.id === currentSpecimenId);
+    if (!record) return;
+
+    const readField = id => {
+        const el = document.getElementById(id);
+        return el ? el.innerText.trim() : '';
+    };
+
+    record.species     = readField('rSpecies');
+    record.author      = readField('rAuthor');
+    record.collector   = readField('rCollector');
+    record.fieldNumber = readField('rFieldNumber');
+    record.date        = readField('rDate');
+    const localityEdited = readField('rLocality');
+    record.localityRaw   = localityEdited;
+    record.localityUsed  = localityEdited; // manual correction supersedes the geocoder's matched term
+    record.finalMGRS   = readField('finalMGRS');
+    record.finalNote   = document.getElementById('finalNote').innerText.trim() + ' (manually corrected)';
+
+    // Re-sync the cached snapshot so a later "View" shows the corrected values.
+    record.snapshotHTML = document.getElementById('resultsAll').innerHTML;
+
+    renderSpecimenTable();
+
+    const status = document.getElementById('saveStatus');
+    if (status) {
+        status.classList.add('show');
+        setTimeout(() => status.classList.remove('show'), 1800);
+    }
+}
+
+function wireSaveCorrectionsButton() {
+    const btn = document.getElementById('saveCorrectionsBtn');
+    if (btn) btn.onclick = saveCorrections;
+    wireRegeocodeButton();
+}
+
+// ── Manual re-geocode ────────────────────────────────────────────────────────
+// Editing the Locality text field only overwrites the stored string — it does
+// NOT automatically re-run geocoding, since that could fire an API call on
+// every keystroke. This button explicitly re-runs the real pipeline
+// (geocodeCandidates, same tiered exact→fuzzy / specific→generic / anchor
+// and county-disambiguation logic used during normal processing) against
+// whatever locality text is currently in the panel, then updates lat/lon,
+// derived MGRS, geo source, and the final MGRS value — and persists all of
+// it to the specimen's record via saveCorrections().
+async function regeocodeFromLocality() {
+    if (!currentSpecimenId) return;
+    const record = allSpecimens.find(s => s.id === currentSpecimenId);
+    if (!record) return;
+
+    const btn = document.getElementById('regeocodeBtn');
+    const localityText = document.getElementById('rLocality').innerText.trim();
+    if (!localityText) {
+        alert('Locality field is empty — nothing to geocode.');
+        return;
+    }
+
+    // The panel can show multiple candidates joined by "  →  " (see
+    // showResults' candidateList.join). Split back into an array so the
+    // full tiered-candidate pipeline runs, same as during normal processing —
+    // not just a single string.
+    const candidates = localityText.split(/\s*→\s*/).map(s => s.trim()).filter(Boolean);
+
+    const originalLabel = btn.textContent;
+    btn.disabled = true;
+    btn.textContent = 'Geocoding…';
+
+    try {
+        resetGeocodeLog(candidates[0], candidates);
+        const coords = await geocodeCandidates(candidates);
+        finalizeGeocodeLog();
+
+        if (!coords) {
+            document.getElementById('rGeoSource').innerText = 'manual re-geocode failed';
+            document.getElementById('rLatLon').innerText = 'Not resolved';
+            alert(`Could not resolve "${candidates.join('", "')}" to a location in Kenya. Try a more specific or differently-spelled place name.`);
+            return;
+        }
+
+        const calcMGRS = MGRS.fromLatLon(coords.lat, coords.lon);
+        const geoSourceLabel = coords.source + ' (manual re-geocode)';
+
+        document.getElementById('rGeoSource').innerText = geoSourceLabel;
+        document.getElementById('rLocalityUsed').innerText = coords.matchedTerm || candidates[0];
+        document.getElementById('rowLocalityCorrected').style.display = 'none';
+        document.getElementById('rLatLon').innerText =
+            `${coords.lat.toFixed(6)}°, ${coords.lon.toFixed(6)}° (via ${coords.source}${coords.matchedTerm ? ' — matched via "' + coords.matchedTerm + '"' : ''})`;
+        document.getElementById('rCalcMGRS').innerText = calcMGRS.full;
+        document.getElementById('finalMGRS').innerText = calcMGRS.full;
+        document.getElementById('finalNote').innerText = `re-geocoded manually from corrected locality "${candidates[0]}"`;
+
+        document.getElementById('crosscheckWrap').style.display = 'none';
+
+        const vCard = document.getElementById('validationCard');
+        vCard.innerHTML = `<div class="validation-card info">
+            <div class="validation-title">Manually re-geocoded</div>
+            <div class="validation-body">
+                Locality <strong>"${coords.matchedTerm || candidates[0]}"</strong> was geocoded to
+                <strong>${coords.lat.toFixed(4)}°, ${coords.lon.toFixed(4)}°</strong>${coords.display ? ' (' + coords.display + ')' : ''}
+                after manual correction, and converted to MGRS.
+            </div>
+        </div>`;
+
+        // lat/lon/geoSource aren't part of saveCorrections()'s normal field
+        // set (they're derived, not directly typed), so set them on the
+        // record explicitly here before reusing saveCorrections() to pick up
+        // the text fields, finalMGRS, and refresh the cached snapshot.
+        record.lat = coords.lat;
+        record.lon = coords.lon;
+        record.geoSource = geoSourceLabel;
+        saveCorrections();
+
+        const status = document.getElementById('regeocodeStatus');
+        if (status) {
+            status.classList.add('show');
+            setTimeout(() => status.classList.remove('show'), 1800);
+        }
+    } catch (e) {
+        console.error('Manual re-geocode failed:', e);
+        alert('Re-geocoding failed: ' + e.message);
+    } finally {
+        btn.disabled = false;
+        btn.textContent = originalLabel;
+    }
+}
+
+function wireRegeocodeButton() {
+    const btn = document.getElementById('regeocodeBtn');
+    if (btn) btn.onclick = regeocodeFromLocality;
+}
+
+function removeSpecimen(id) {
+    allSpecimens = allSpecimens.filter(s => s.id !== id);
+    renderSpecimenTable();
+}
+
+function escapeHtml(s) {
+    return String(s == null ? '' : s).replace(/[&<>"']/g, c => ({
+        '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
+    }[c]));
+}
+
+// ── BRAHMS Collector / Field Number split ───────────────────────────────────
+// Herbarium labels almost always record the collector as "Name Number"
+// (e.g. "P. Kuchar 13880"), but BRAHMS keeps these as separate fields
+// (Collector Name vs Field Number, formerly "Collector Number"). This is a
+// deterministic, code-level split — never guessed by the LLM — using the
+// same principle as splitScientificName(): find the trailing token(s) that
+// look like a specimen number (digits, optionally with a trailing letter
+// suffix for split sheets/duplicates, e.g. "13880" or "13880a") and treat
+// everything before that as the collector's name.
+function splitCollectorFieldNumber(collectorStr) {
+    if (!collectorStr || typeof collectorStr !== 'string') return { name: '', fieldNumber: '' };
+    const trimmed = collectorStr.trim().replace(/\s+/g, ' ');
+    if (!trimmed) return { name: '', fieldNumber: '' };
+
+    const m = trimmed.match(/^(.*?)\s+(\d+[a-zA-Z]?)$/);
+    if (m) {
+        return { name: m[1].trim(), fieldNumber: m[2].trim() };
+    }
+    // No trailing number found — whole string is the name, field number left blank.
+    return { name: trimmed, fieldNumber: '' };
+}
+
+function renderSpecimenTable() {
+    const countEl = document.getElementById('specimenCount');
+    const emptyEl = document.getElementById('batchEmpty');
+    const tableEl = document.getElementById('specimenTable');
+    const bodyEl  = document.getElementById('specimenTableBody');
+
+    countEl.textContent = allSpecimens.length;
+
+    if (allSpecimens.length === 0) {
+        emptyEl.style.display = 'block';
+        tableEl.style.display = 'none';
+        bodyEl.innerHTML = '';
+        return;
+    }
+    emptyEl.style.display = 'none';
+    tableEl.style.display = 'table';
+
+    bodyEl.innerHTML = allSpecimens.map(r => {
+        // fieldNumber is normally already resolved at extraction time (see
+        // normalizeExtracted's collector/field_number split). The fallback
+        // split here only matters for specimens that predate that field
+        // being tracked, or a name string that still has a trailing number.
+        const fallback = splitCollectorFieldNumber(r.collector);
+        const collectorName = fallback.name || r.collector || '';
+        const fieldNumber = r.fieldNumber || fallback.fieldNumber || '';
+        return `
+        <tr>
+            <td><img class="sp-thumb" src="${r.thumb}" alt=""></td>
+            <td>
+                <span class="sp-species">${escapeHtml(r.species) || '<span class="sp-empty-cell">not found</span>'}</span>
+                ${r.author ? `<br><span style="font-size:0.72rem;color:#8a9a8a">${escapeHtml(r.author)}</span>` : ''}
+            </td>
+            <td class="sp-mgrs">${escapeHtml(r.finalMGRS) || '<span class="sp-empty-cell">—</span>'}</td>
+            <td style="font-size:0.72rem;color:#6b7a6b">${escapeHtml(r.geoSource) || '—'}</td>
+            <td style="font-size:0.78rem;max-width:220px;">${escapeHtml(r.localityUsed || r.localityRaw) || '<span class="sp-empty-cell">—</span>'}</td>
+            <td style="font-size:0.78rem;">${escapeHtml(r.date) || '—'}</td>
+            <td style="font-size:0.78rem;">${escapeHtml(collectorName) || '—'}</td>
+            <td style="font-size:0.78rem;">${escapeHtml(fieldNumber) || '<span class="sp-empty-cell">—</span>'}</td>
+            <td>
+                <div class="row-actions">
+                    <button class="row-btn" onclick="viewSpecimen('${r.id}')">View</button>
+                    <button class="row-btn danger" onclick="removeSpecimen('${r.id}')">Remove</button>
+                </div>
+            </td>
+        </tr>
+    `;
+    }).join('');
+}
+
+// ─── BRAHMS CSV export ─────────────────────────────────────────────────────
+// Column set follows BRAHMS's standard field structure across its Taxa,
+// Specimens, and Species Link tables:
+//   - Taxonomic/nomenclatural: Family, Genus, Species, Author, #Full Name
+//   - Collection event: Collector (name only), Field Number (formerly
+//     "Collector Number" — split out from the combined label string),
+//     Date Collected, Determined By / Determination Date (left blank — not
+//     present on original collection labels; filled in during identification)
+//   - Geographic: Country, Gazetteer (the matched/most specific place name —
+//     BRAHMS links this to its own gazetteer table), Locality Notes (the
+//     fuller free-text description / other candidates), Latitude, Longitude
+//     (decimal degrees), Map Grid Area (BRAHMS's dedicated MGRS/grid field)
+//   - Physical/voucher: Barcode, Accession Number, Herbarium Code, Type
+//     Status, Duplicates — left blank, since none of these are derivable
+//     from a collection label; they're assigned at accessioning, not in the
+//     field, so filling them here would mean fabricating identifiers.
+// Rename any header below to match your exact BRAHMS import template if it
+// differs — row content stays the same either way.
+function exportBRAHMSCSV() {
+    if (allSpecimens.length === 0) return;
+
+    const headers = [
+        'Family', 'Genus', 'Species', 'Author', '#Full Name',
+        'Collector', 'Field Number', 'Date Collected',
+        'Determined By', 'Determination Date',
+        'Country', 'Gazetteer', 'Locality Notes',
+        'Latitude', 'Longitude', 'Map Grid Area', 'Georef Source',
+        'Barcode', 'Accession Number', 'Herbarium Code', 'Type Status', 'Duplicates',
+        'Extraction Method', 'Notes'
+    ];
+
+    const rows = allSpecimens.map(r => {
+        const speciesParts = (r.species || '').trim().split(/\s+/).filter(Boolean);
+        const genus = speciesParts[0] || '';
+        const speciesEpithet = speciesParts.slice(1).join(' ');
+        const fullName = [r.species, r.author].filter(Boolean).join(' ');
+        const fallback = splitCollectorFieldNumber(r.collector);
+        const collectorName = fallback.name || r.collector || '';
+        const fieldNumber = r.fieldNumber || fallback.fieldNumber || '';
+
+        // Gazetteer = the specific place name that was actually matched
+        // (or the first/most-specific extracted candidate if MGRS came
+        // straight from the label and geocoding was skipped). Locality
+        // Notes = every other candidate extracted from the label, kept as
+        // free text rather than forced into the gazetteer-linked field.
+        const candidateList = (r.localityRaw || '').split(' / ').filter(Boolean);
+        const gazetteer = r.localityUsed || candidateList[0] || '';
+        const localityNotes = candidateList.filter(c => c !== gazetteer).join('; ');
+
+        return [
+            r.family, genus, speciesEpithet, r.author, fullName,
+            collectorName, fieldNumber, r.date,
+            '', '', // Determined By / Determination Date — not on collection labels
+            'Kenya', gazetteer, localityNotes,
+            r.lat != null ? r.lat.toFixed(6) : '',
+            r.lon != null ? r.lon.toFixed(6) : '',
+            r.finalMGRS, r.geoSource,
+            '', '', '', '', '', // Barcode / Accession / Herbarium Code / Type Status / Duplicates — assigned at accessioning
+            r.method, r.finalNote
+        ];
+    });
+
+    const csv = [headers, ...rows].map(row =>
+        row.map(cell => `"${String(cell || '').replace(/"/g, '""')}"`).join(',')
+    ).join('\n');
+
+    const blob = new Blob([csv], { type: 'text/csv' });
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = 'herbarium_specimens_brahms.csv';
+    a.click();
+}
+
+document.getElementById('exportCsvBtn').addEventListener('click', exportBRAHMSCSV);
+document.getElementById('clearAllBtn').addEventListener('click', () => {
+    allSpecimens = [];
+    renderSpecimenTable();
+});
+wireSaveCorrectionsButton(); // binds the button as it exists in the initial static markup
+</script>
+
+<script>
 // ─── Main processing pipeline ─────────────────────────────────────────────────
-async function processFile(file) {
+// Unchanged from the single-specimen version except: (1) accepts a thumbSrc
+// so the batch registry can store a thumbnail, (2) the trailing setTimeout is
+// now awaited so callers can know when a specimen is fully processed and
+// rendered, (3) calls registerSpecimen() at the very end.
+async function processFile(file, thumbSrc) {
     // Reset UI
     document.getElementById('progressWrap').style.display = 'block';
     document.getElementById('emptyState').style.display   = 'none';
@@ -2159,8 +2609,6 @@ async function processFile(file) {
     try {
         base64 = await preprocessForVision(file);
         if (!base64) {
-            // Preprocessing failed for some reason — fall back to sending the
-            // raw file exactly as before.
             base64 = await new Promise((res, rej) => {
                 const r = new FileReader();
                 r.onload = () => res(r.result.split(',')[1]);
@@ -2177,8 +2625,7 @@ async function processFile(file) {
         console.warn('Vision extraction failed:', e);
         setStep('step-vision', '');
 
-        // ── Step 2: OCR fallback — preprocessed (grayscale + binarized +
-        // upscaled) image, PSM 6 (uniform block) ───────────────────────────
+        // ── Step 2: OCR fallback ─────────────────────────────────────────
         setStep('step-ocr', 'active');
         try {
             const ocrCanvas = await preprocessForOCR(file);
@@ -2194,8 +2641,6 @@ async function processFile(file) {
         }
     }
 
-    // Reset the geocode activity log for this specimen now that we know the
-    // raw locality candidates that came out of extraction.
     const rawCandidates = extracted.locality_candidates || [];
     resetGeocodeLog(extracted.locality || null, rawCandidates);
 
@@ -2205,11 +2650,6 @@ async function processFile(file) {
     let convertedMGRS = null;
 
     // ── Step 3: Cross-check the MGRS field ──────────────────────────────────
-    // Runs regardless of whether vision or OCR-fallback extraction was used.
-    // If vision already succeeded, this is the FIRST OCR pass for this
-    // specimen (a lightweight, local, no-API-cost scan — not a second full
-    // Tesseract+LLM extraction). If OCR fallback already ran above, its text
-    // is reused here rather than scanning the image twice.
     setStep('step-crosscheck', 'active');
     let crossCheck = null;
     try {
@@ -2237,30 +2677,21 @@ async function processFile(file) {
         setStep('step-crosscheck', '');
     }
 
-    // If the label carried an MGRS value, try to parse/convert it (now with
-    // character-confusion correction as a last-resort fallback — see
-    // MGRS.parseWithCorrection). convertedMGRS stays null if parsing fails
-    // even with correction applied.
     if (extracted.mgrs_coordinates) {
         convertedMGRS = MGRS.alToAA(extracted.mgrs_coordinates);
     }
 
     if (extracted.mgrs_coordinates && convertedMGRS && convertedMGRS.full) {
-        // ── MGRS present on label AND successfully parsed: convert AL → AA
-        // scheme directly ─────────────────────────────────────────────────
         ['step-spell', 'step-geocode', 'step-convert'].forEach(s => setStep(s, 'done'));
         console.log(`MGRS present on label ("${extracted.mgrs_coordinates}") — skipping geocoding, converting AL → AA scheme directly: ${convertedMGRS.full}${convertedMGRS.corrected ? ' (character correction applied: ' + convertedMGRS.correctionsApplied.join(', ') + ')' : ''}`);
         if (geocodeLog) {
             geocodeLog.finalLocalityUsed = '(skipped — MGRS present on label, converted AL→AA instead)';
         }
     } else {
-        // ── No MGRS on label, OR an MGRS was recorded but couldn't be
-        // parsed even with correction: fall back to locality geocoding ─────
         if (extracted.mgrs_coordinates && !(convertedMGRS && convertedMGRS.full)) {
             console.error(`⚠️ Could not parse recorded MGRS "${extracted.mgrs_coordinates}" even with character-confusion correction — falling back to geocoding from locality instead.`);
         }
 
-        // ── Step 4/5: Geocode using ALL locality candidates ──────────────────
         setStep('step-spell', 'active');
         if (rawCandidates.length > 0) {
             try {
@@ -2269,7 +2700,6 @@ async function processFile(file) {
         }
         setStep('step-spell', 'done');
 
-        // ── Step 5b: Spell-check fallback ────────────────────────────────────
         setStep('step-geocode', 'active');
         if (!coords && originalLocality) {
             const result = await spellCheckLocality(originalLocality);
@@ -2289,7 +2719,6 @@ async function processFile(file) {
         }
         setStep('step-geocode', coords ? 'done' : '');
 
-        // ── Step 6: Convert to MGRS ───────────────────────────────────────────
         setStep('step-convert', 'active');
         if (coords) {
             calcMGRS = MGRS.fromLatLon(coords.lat, coords.lon);
@@ -2298,23 +2727,70 @@ async function processFile(file) {
         setStep('step-convert', calcMGRS ? 'done' : '');
     }
 
-    // Print the full geocode activity trail for this specimen.
     finalizeGeocodeLog();
 
     // ── Step 7: Validate ──────────────────────────────────────────────────────
     setStep('step-validate', 'active');
-    setTimeout(() => {
-        setStep('step-validate', 'done');
-        document.getElementById('progressWrap').style.display = 'none';
-        showResults(extracted, coords, calcMGRS, method, originalLocality, convertedMGRS, crossCheck);
-    }, 300);
+    await new Promise(resolve => setTimeout(resolve, 300));
+    setStep('step-validate', 'done');
+    document.getElementById('progressWrap').style.display = 'none';
+    showResults(extracted, coords, calcMGRS, method, originalLocality, convertedMGRS, crossCheck);
+
+    // NEW: archive this specimen into the batch registry / table below.
+    registerSpecimen(thumbSrc, extracted, coords, calcMGRS, convertedMGRS, method);
 }
 
-// ─── Events ───────────────────────────────────────────────────────────────────
+// ─── Events (batch-queue aware) ────────────────────────────────────────────
 const dropZone   = document.getElementById('dropZone');
 const fileInput  = document.getElementById('fileInput');
 const previewWrap = document.getElementById('previewWrap');
 const imagePreview = document.getElementById('imagePreview');
+
+let fileQueue = [];
+let isProcessingQueue = false;
+
+function updateQueueIndicator() {
+    const ind = document.getElementById('queueIndicator');
+    const list = document.getElementById('queueList');
+    if (fileQueue.length > 0) {
+        ind.textContent = `${fileQueue.length} queued`;
+        ind.classList.add('active');
+    } else {
+        ind.classList.remove('active');
+    }
+    list.innerHTML = fileQueue.map(f => `<div class="queue-list-item">waiting: ${escapeHtml(f.name)}</div>`).join('');
+}
+
+function enqueueFiles(fileList) {
+    fileQueue.push(...Array.from(fileList));
+    updateQueueIndicator();
+    processQueue();
+}
+
+async function processQueue() {
+    if (isProcessingQueue) return;
+    isProcessingQueue = true;
+    while (fileQueue.length > 0) {
+        const file = fileQueue.shift();
+        updateQueueIndicator();
+        await handleFile(file);
+    }
+    updateQueueIndicator();
+    isProcessingQueue = false;
+}
+
+function handleFile(file) {
+    return new Promise((resolve) => {
+        const reader = new FileReader();
+        reader.onload = async (e) => {
+            imagePreview.src = e.target.result;
+            previewWrap.style.display = 'block';
+            await processFile(file, e.target.result);
+            resolve();
+        };
+        reader.readAsDataURL(file);
+    });
+}
 
 dropZone.addEventListener('click', () => fileInput.click());
 dropZone.addEventListener('dragover', e => { e.preventDefault(); dropZone.classList.add('drag-over'); });
@@ -2322,9 +2798,9 @@ dropZone.addEventListener('dragleave', () => dropZone.classList.remove('drag-ove
 dropZone.addEventListener('drop', e => {
     e.preventDefault();
     dropZone.classList.remove('drag-over');
-    if (e.dataTransfer.files[0]) handleFile(e.dataTransfer.files[0]);
+    if (e.dataTransfer.files.length) enqueueFiles(e.dataTransfer.files);
 });
-fileInput.addEventListener('change', e => { if (e.target.files[0]) handleFile(e.target.files[0]); });
+fileInput.addEventListener('change', e => { if (e.target.files.length) enqueueFiles(e.target.files); });
 document.getElementById('clearBtn').addEventListener('click', () => {
     previewWrap.style.display = 'none';
     fileInput.value = '';
@@ -2333,16 +2809,6 @@ document.getElementById('clearBtn').addEventListener('click', () => {
     document.getElementById('emptyState').style.display = 'flex';
     document.getElementById('progressWrap').style.display = 'none';
 });
-
-function handleFile(file) {
-    const reader = new FileReader();
-    reader.onload = e => {
-        imagePreview.src = e.target.result;
-        previewWrap.style.display = 'block';
-        processFile(file);
-    };
-    reader.readAsDataURL(file);
-}
 
 // ─── Connection test ──────────────────────────────────────────────────────────
 document.getElementById('testBtn').addEventListener('click', async () => {
