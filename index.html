@@ -262,6 +262,19 @@
         .validation-card.info .validation-title { color: #2a4e82; }
         .validation-body { font-size: 0.8125rem; color: #5a6a5a; line-height: 1.5; }
 
+        /* Cross-check card */
+        .crosscheck-card {
+            border-radius: 8px;
+            padding: 0.875rem 1.125rem;
+            border: 1.5px solid;
+            font-size: 0.8125rem;
+        }
+        .crosscheck-card.agree { background: #f2faf5; border-color: #3d9e5e; color: #1e6636; }
+        .crosscheck-card.disagree { background: #fef7e6; border-color: #c98a1a; color: #7a5100; }
+        .crosscheck-card.partial { background: #f2f6fd; border-color: #4a7fc1; color: #2a4e82; }
+        .crosscheck-row { display: flex; gap: 8px; margin-top: 4px; font-family: 'IBM Plex Mono', monospace; }
+        .crosscheck-row span:first-child { color: #8a9a8a; font-family: 'Inter', sans-serif; min-width: 120px; }
+
         /* Final MGRS */
         .final-block {
             background: #1a1f1a;
@@ -367,6 +380,10 @@
                     <div class="step-dot"></div>
                     <span>OCR fallback (Tesseract)</span>
                 </div>
+                <div class="progress-step" id="step-crosscheck">
+                    <div class="step-dot"></div>
+                    <span>Cross-checking MGRS reading</span>
+                </div>
                 <div class="progress-step" id="step-spell">
                     <div class="step-dot"></div>
                     <span>Spell-checking locality name</span>
@@ -440,6 +457,11 @@
                         <div class="field-val" id="rGeoSource">—</div>
                     </div>
                 </div>
+            </div>
+
+            <div id="crosscheckWrap" style="display:none">
+                <div class="panel-label">MGRS cross-check</div>
+                <div id="crosscheckCard"></div>
             </div>
 
             <div>
@@ -566,6 +588,149 @@ function finalizeGeocodeLog() {
     console.log('%c───────────────────────────────────────────────────', 'color:#3d9e5e;font-weight:bold');
 }
 
+// ─── Image preprocessing ──────────────────────────────────────────────────────
+// Vision models and Tesseract benefit from different preprocessing strategies.
+// The vision model wants a bigger, still-natural-looking image — a mild
+// upscale plus a gentle contrast lift, without binarization, since stripping
+// out grayscale nuance (faint ink, paper tone) can remove context a vision
+// model would otherwise use. Tesseract, a classical OCR engine with no
+// semantic understanding to fall back on, benefits from much more aggressive
+// treatment: grayscale, contrast stretching, and binarization, on top of the
+// same upscale.
+const PREPROCESS_TARGET_LONG_EDGE = 1800; // px — only ever upscales, never downscales
+
+function clamp255(v) { return Math.max(0, Math.min(255, v)); }
+
+function loadImageFromFile(file) {
+    return new Promise((resolve, reject) => {
+        const img = new Image();
+        img.onload = () => { resolve(img); URL.revokeObjectURL(img.src); };
+        img.onerror = reject;
+        img.src = URL.createObjectURL(file);
+    });
+}
+
+function drawScaledToCanvas(img, targetLongEdge) {
+    const longEdge = Math.max(img.width, img.height);
+    const scale = longEdge < targetLongEdge ? targetLongEdge / longEdge : 1;
+    const w = Math.max(1, Math.round(img.width * scale));
+    const h = Math.max(1, Math.round(img.height * scale));
+    const canvas = document.createElement('canvas');
+    canvas.width = w;
+    canvas.height = h;
+    const ctx = canvas.getContext('2d');
+    ctx.imageSmoothingEnabled = true;
+    ctx.imageSmoothingQuality = 'high';
+    ctx.drawImage(img, 0, 0, w, h);
+    return canvas;
+}
+
+function canvasToBase64(canvas, quality = 0.92) {
+    const dataUrl = canvas.toDataURL('image/jpeg', quality);
+    return dataUrl.split(',')[1];
+}
+
+// Mild preprocessing for the vision model: upscale small images, plus a
+// gentle contrast boost. Returns a base64 JPEG string, or null on failure
+// (caller should fall back to sending the raw, unprocessed file instead).
+async function preprocessForVision(file) {
+    try {
+        const img = await loadImageFromFile(file);
+        const canvas = drawScaledToCanvas(img, PREPROCESS_TARGET_LONG_EDGE);
+        const ctx = canvas.getContext('2d');
+        const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+        const data = imageData.data;
+        const contrast = 15; // mild — keep the image looking natural
+        const factor = (259 * (contrast + 255)) / (255 * (259 - contrast));
+        for (let i = 0; i < data.length; i += 4) {
+            data[i]   = clamp255(factor * (data[i]   - 128) + 128);
+            data[i+1] = clamp255(factor * (data[i+1] - 128) + 128);
+            data[i+2] = clamp255(factor * (data[i+2] - 128) + 128);
+        }
+        ctx.putImageData(imageData, 0, 0);
+        return canvasToBase64(canvas);
+    } catch (e) {
+        console.warn('Vision preprocessing failed, falling back to original image:', e);
+        return null;
+    }
+}
+
+// Aggressive preprocessing for Tesseract: grayscale → mean-based binarize →
+// upscale. Returns a <canvas> element (Tesseract.recognize accepts canvases
+// directly), or null on failure (caller falls back to the raw file).
+async function preprocessForOCR(file) {
+    try {
+        const img = await loadImageFromFile(file);
+        const canvas = drawScaledToCanvas(img, PREPROCESS_TARGET_LONG_EDGE);
+        const ctx = canvas.getContext('2d');
+        const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+        const data = imageData.data;
+
+        const gray = new Float32Array(data.length / 4);
+        for (let i = 0, j = 0; i < data.length; i += 4, j++) {
+            gray[j] = 0.299 * data[i] + 0.587 * data[i+1] + 0.114 * data[i+2];
+        }
+
+        let sum = 0;
+        for (let j = 0; j < gray.length; j++) sum += gray[j];
+        const mean = sum / gray.length;
+        // Slightly below the mean so faint/aged ink is still captured as
+        // black rather than washed out to white.
+        const threshold = mean * 0.92;
+
+        for (let i = 0, j = 0; i < data.length; i += 4, j++) {
+            const v = gray[j] > threshold ? 255 : 0;
+            data[i] = data[i+1] = data[i+2] = v;
+        }
+        ctx.putImageData(imageData, 0, 0);
+        return canvas;
+    } catch (e) {
+        console.warn('OCR preprocessing failed, falling back to original image:', e);
+        return null;
+    }
+}
+
+// ─── Tesseract OCR helpers (page-segmentation-mode aware) ─────────────────────
+// Default Tesseract PSM (page segmentation mode) often fights herbarium label
+// layouts, which mix printed and handwritten text in irregular blocks. PSM 6
+// ("assume a single uniform block of text") generally outperforms the default
+// for full-label reads. A second, sparse-text pass (PSM 11) with a tight
+// character whitelist is used only when hunting for an MGRS-like token — it's
+// tuned for isolated short strings rather than paragraphs.
+const TESSERACT_PSM_SINGLE_BLOCK = '6';
+const TESSERACT_PSM_SPARSE_TEXT  = '11';
+
+async function runTesseractOCR(imageSource, { psm, whitelist } = {}) {
+    const worker = await Tesseract.createWorker('eng');
+    try {
+        const params = {};
+        if (psm) params.tessedit_pageseg_mode = psm;
+        if (whitelist) params.tessedit_char_whitelist = whitelist;
+        if (Object.keys(params).length > 0) await worker.setParameters(params);
+        const { data } = await worker.recognize(imageSource);
+        return data.text;
+    } finally {
+        await worker.terminate();
+    }
+}
+
+// Full-label OCR text, tuned for uniform-block layout. Used both for the
+// vision-failure fallback extraction pass and as raw material for the MGRS
+// cross-check regex scan.
+async function runTesseractFullText(imageSource) {
+    return runTesseractOCR(imageSource, { psm: TESSERACT_PSM_SINGLE_BLOCK });
+}
+
+// Narrow, whitelist-restricted OCR pass tuned specifically for finding a
+// short alphanumeric grid-reference token (sparse text, digits + uppercase
+// letters only — no lowercase, since MGRS strings never contain any).
+async function runTesseractMGRSPass(imageSource) {
+    return runTesseractOCR(imageSource, {
+        psm: TESSERACT_PSM_SPARSE_TEXT,
+        whitelist: '0123456789ABCDEFGHJKLMNPQRSTUVWXYZ'
+    });
+}
+
 // ─── MGRS Converter ───────────────────────────────────────────────────────────
 const MGRS = {
     degToRad(d) { return d * Math.PI / 180; },
@@ -627,10 +792,17 @@ const MGRS = {
         return m ? m[3] : null;
     },
 
-    // Returns { zone, band, square } from an MGRS string
+    // Returns { zone, band, square } from an MGRS string.
+    // NOTE: this pattern is intentionally NOT anchored to the start of the
+    // string. Recorded label values are copied verbatim during extraction
+    // (by design — see the extraction prompts), so they can carry a leading
+    // label like "UTM " or "MGRS:" before the actual grid reference (e.g.
+    // "UTM 37MBK4042"). An anchored `^` match would fail on anything with a
+    // non-digit prefix and silently return null here, which previously made
+    // alToAA() bail out and made the AL→AA conversion appear to do nothing.
     parsePrefix(str) {
         if (!str) return null;
-        const m = str.toUpperCase().replace(/\s+/g,'').match(/^(\d{1,2})([C-XY])([A-HJ-NP-Z]{2})/);
+        const m = str.toUpperCase().replace(/\s+/g,'').match(/(\d{1,2})([C-XY])([A-HJ-NP-Z]{2})/);
         if (!m) return null;
         return { zone: m[1], band: m[2], square: m[3] };
     },
@@ -650,12 +822,113 @@ const MGRS = {
     // Builds a corrected MGRS: takes the calculated zone/band/square
     // but keeps the RECORDED easting/northing digits unchanged
     correctMGRS(recordedStr, calcZone, calcBand, calcSquare) {
-        const nums = this.parseNumerics(recordedStr);
+        const nums = this.parseNumerics(recordedStr) || (this.parseWithCorrection(recordedStr) || {}).nums;
         if (!nums) return null;
         return `${calcZone}${calcBand} ${calcSquare} ${nums.easting} ${nums.northing}`;
+    },
+
+    // ── Character-confusion-aware lenient parsing ───────────────────────────
+    // Vision/OCR models routinely confuse visually similar characters in
+    // cramped typewriter or handwritten coordinate strings — most commonly
+    // O/D/Q ↔ 0, I/L ↔ 1, B ↔ 8, S ↔ 5, Z ↔ 2, G ↔ 6, T ↔ 7. A strict digit-
+    // only regex (parseNumerics above) fails outright the moment one of
+    // these creeps into the numeric easting/northing block (e.g.
+    // "37MCKD182" instead of "37MCK0182"). parseWithCorrection() is a
+    // last-resort fallback: it never touches the zone/band/100km-square
+    // prefix (that part is short, always letters + 1-2 digits, and rarely
+    // garbled), but if the trailing numeric block fails to parse as-is, it
+    // retries after mapping confusable letters back to their digit
+    // equivalents — and only accepts the result if that produces a clean,
+    // fully-numeric easting/northing block.
+    CONFUSABLE_TO_DIGIT: { 'O':'0', 'D':'0', 'Q':'0', 'I':'1', 'L':'1', 'B':'8', 'S':'5', 'Z':'2', 'G':'6', 'T':'7' },
+
+    correctConfusableDigits(s) {
+        return s.split('').map(ch => this.CONFUSABLE_TO_DIGIT[ch] || ch).join('');
+    },
+
+    // Returns { prefix: {zone,band,square}, nums: {easting,northing}, corrected, correctionsApplied }
+    // or null if the string can't be parsed even with correction applied.
+    parseWithCorrection(mgrsStr) {
+        if (!mgrsStr) return null;
+        const clean = mgrsStr.toUpperCase().replace(/\s+/g, '');
+
+        // Attempt 1: strict parse, no correction needed — trust this outright.
+        const strictPrefix = this.parsePrefix(clean);
+        const strictNums = this.parseNumerics(clean);
+        if (strictPrefix && strictNums) {
+            return { prefix: strictPrefix, nums: strictNums, corrected: false, correctionsApplied: [] };
+        }
+
+        // Attempt 2: locate the prefix strictly (zone digits + band letter +
+        // 2-letter square — this is never the part that's garbled in
+        // practice), then treat everything after it as the numeric block and
+        // correct confusable characters only within that trailing portion.
+        const prefixMatch = clean.match(/^.*?(\d{1,2})([C-XY])([A-HJ-NP-Z]{2})(.*)$/);
+        if (!prefixMatch) return null;
+        const [, zone, band, square, rest] = prefixMatch;
+        if (!rest || rest.length < 2) return null;
+
+        const correctionsApplied = [];
+        const correctedRest = rest.split('').map(ch => {
+            if (/[0-9]/.test(ch)) return ch;
+            const digit = this.CONFUSABLE_TO_DIGIT[ch];
+            if (digit) { correctionsApplied.push(`${ch}→${digit}`); return digit; }
+            return ch; // leave unrecognized characters as-is; will fail the all-digit check below
+        }).join('');
+
+        if (!/^\d+$/.test(correctedRest) || correctedRest.length < 2) return null;
+
+        const half = Math.floor(correctedRest.length / 2);
+        return {
+            prefix: { zone, band, square },
+            nums: { easting: correctedRest.slice(0, half), northing: correctedRest.slice(half) },
+            corrected: correctionsApplied.length > 0,
+            correctionsApplied
+        };
+    },
+
+    // ── AL scheme → AA scheme row-letter conversion ─────────────────────────
+    // MGRS 100km-square identifiers can be expressed in one of two lettering
+    // schemes, depending on which reference ellipsoid the underlying grid was
+    // originally computed against:
+    //   - AA scheme: the current NGA/WGS84 standard. This is what every
+    //     modern GPS receiver, GIS package, and fromLatLon() above produce.
+    //   - AL scheme: an older scheme tied to legacy, pre-WGS84 regional
+    //     ellipsoids (e.g. Clarke 1880 / War Office, historically used on
+    //     older Kenyan survey maps). Older herbarium labels can carry MGRS
+    //     grid references written this way.
+    // Both schemes share the same 20-letter row alphabet (A-V, excluding I
+    // and O) and the same column alphabet, but the ROW letter is offset by
+    // exactly 10 positions (half the 20-letter cycle) between the two
+    // schemes. The COLUMN letter is unchanged. E.g. row letter "K" (index 9)
+    // in AL corresponds to row letter "V" (index 19) in AA:
+    // (9 + 10) % 20 = 19 → 37M BK 4042 (AL) → 37M BV 4042 (AA).
+    ROW_ALPHABET_20: 'ABCDEFGHJKLMNPQRSTUV',
+
+    // Converts a recorded MGRS string (assumed to be in the legacy AL
+    // scheme) to the current AA scheme. Zone, band, column letter, and the
+    // numeric easting/northing digits are all preserved unchanged — only the
+    // row letter is remapped. Returns null if the string can't be parsed
+    // even with character-confusion correction applied. On success, also
+    // returns metadata about whether/what correction was needed, so the UI
+    // can surface that to the user rather than silently "fixing" it.
+    alToAA(mgrsStr) {
+        const parsed = this.parseWithCorrection(mgrsStr);
+        if (!parsed) return null;
+        const { prefix, nums, corrected, correctionsApplied } = parsed;
+        const colLetter = prefix.square[0];
+        const rowLetterAL = prefix.square[1];
+        const rowIdx = this.ROW_ALPHABET_20.indexOf(rowLetterAL);
+        if (rowIdx === -1) return null;
+        const rowLetterAA = this.ROW_ALPHABET_20[(rowIdx + 10) % 20];
+        const newSquare = colLetter + rowLetterAA;
+        const full = `${prefix.zone}${prefix.band} ${newSquare} ${nums.easting} ${nums.northing}`;
+        return { full, corrected, correctionsApplied };
     }
 };
+</script>
 
+<script>
 // ─── Scientific name / author citation splitter ───────────────────────────────
 // Herbarium labels and vision/OCR extraction commonly return the species name
 // and its author citation as one combined string, e.g. "Uvaria lucida Benth."
@@ -840,6 +1113,10 @@ IMPORTANT RULES FOR species_name / author_citation:
 - Example: label text "Acacia mellifera (Vahl) Benth." → species_name: "Acacia mellifera", author_citation: "(Vahl) Benth."
 - If no author citation is visible, set author_citation to null and do not guess one.
 
+IMPORTANT RULES FOR mgrs_coordinates:
+- Read the grid-reference/coordinate text CHARACTER BY CHARACTER, exactly as printed. Do NOT infer, auto-correct, or "clean up" what you see — report exactly what is printed, even if a character looks unusual or the result looks malformed.
+- Copy the value EXACTLY as written, including any spaces or formatting. If no MGRS grid reference appears on the label, return null — do not guess or infer one.
+
 IMPORTANT RULES FOR locality_candidates:
 - Extract EVERY distinct place name on the label — not just the most specific one. Herbarium labels often mention a small feature (a peak, valley, ridge, stream) AND a larger, well-known landmark (a mountain, forest, county, or national park) in the same description. Include all of them as separate array entries.
 - Order the array from most specific (e.g. 'Gamia Peaks', 'Teleki Valley') to most general (e.g. 'Mount Kenya'). The most general, most well-known entry is often the most reliable for geocoding, even though it's listed last.
@@ -847,7 +1124,6 @@ IMPORTANT RULES FOR locality_candidates:
 - NEVER include a purely descriptive phrase as its own candidate, even if it also contains a real place name within it. For example, if the label reads "small hill at the western side of Ngong hills", do NOT add "small hill at the western side of Ngong hills" as a candidate — only add the actual place name extracted from it, i.e. 'Ngong hills' (and 'Ngong'). A candidate should be a name you could look up on a map, not a description of where something is relative to a name.
 - Do not merge multiple place names into one string. "Ridge between S & Naro Moru Streams, Mount Kenya" should become separate entries like 'Naro Moru', 'Mount Kenya' — not one combined string.
 - Return an empty array only if no place name is visible anywhere on the label.
-- For mgrs_coordinates: copy the value EXACTLY as written, including any spaces or formatting. If no MGRS grid reference appears on the label, return null — do not guess or infer one.
 - If MGRS is null, locality_candidates will be geocoded to derive coordinates, so capturing every candidate (especially well-known landmarks) is critical.
 
 Return only the JSON object, no other text.`;
@@ -883,6 +1159,9 @@ IMPORTANT RULES FOR species_name / author_citation:
 - Example: text "Acacia mellifera (Vahl) Benth." → species_name: "Acacia mellifera", author_citation: "(Vahl) Benth."
 - If no author citation is present, set author_citation to null and do not guess one.
 
+IMPORTANT RULES FOR mgrs_coordinates:
+- Copy the grid-reference/coordinate text CHARACTER BY CHARACTER, exactly as it appears in the OCR text. Do not infer or auto-correct. If no MGRS grid reference is present in the text, return null — do not invent one.
+
 IMPORTANT RULES FOR locality_candidates:
 - Extract EVERY distinct place name in the text — not just the most specific one. Herbarium labels often mention a small feature (a peak, valley, ridge, stream) AND a larger, well-known landmark (a mountain, forest, county, or national park). Include all of them as separate array entries.
 - Order the array from most specific to most general. The most general, most well-known entry (e.g. 'Mount Kenya', 'Tsavo East') is often the most reliable for geocoding, even though it's listed last.
@@ -890,7 +1169,6 @@ IMPORTANT RULES FOR locality_candidates:
 - NEVER include a purely descriptive phrase as its own candidate, even if it also contains a real place name within it. For example, if the text reads "small hill at the western side of Ngong hills", do NOT add "small hill at the western side of Ngong hills" as a candidate — only add the actual place name extracted from it, i.e. 'Ngong hills' (and 'Ngong'). A candidate should be a name you could look up on a map, not a description of where something is relative to a name.
 - Do not merge multiple place names into one string.
 - Return an empty array only if no place name is present anywhere in the text.
-- For mgrs_coordinates: copy EXACTLY as written. If no MGRS grid reference is present in the text, return null — do not invent one.
 - If mgrs_coordinates is null, locality_candidates will be geocoded to derive coordinates, so capturing every candidate (especially well-known landmarks) is critical.
 
 OCR TEXT:
@@ -902,6 +1180,111 @@ ${ocrText}`;
     ]);
     const match = raw.match(/\{[\s\S]*\}/);
     return normalizeExtracted(JSON.parse(match ? match[0] : '{}'));
+}
+
+// ─── MGRS field cross-validation (narrow vision re-read + OCR scan) ───────────
+// The MGRS/coordinate field is the single most consequential extraction — one
+// misread character can produce a completely wrong 100km square, which is
+// exactly what happened with "37MCKD182". Rather than trusting whichever
+// method produced a value first, when a candidate MGRS-like string exists we
+// re-read it with a second, narrowly-scoped pass and cross-check it against
+// an independent OCR scan, then log any disagreement so it's visible.
+
+// A second, deliberately narrow vision prompt that looks ONLY at the
+// coordinate text and is explicitly told not to "clean up" what it reads.
+// This catches cases where the main, do-everything-at-once extraction pass
+// pattern-matches a garbled character to something that "looks right"
+// instead of reporting what's actually printed.
+async function rereadMGRSField(base64, mimeType) {
+    const prompt = `Look ONLY at the coordinate/grid-reference text on this herbarium label (it may be labeled "MGRS", "UTM", "Grid Ref", or simply appear as a code like "37M BK 4042 1234").
+
+Read it character by character, exactly as printed. Do NOT infer, correct, or guess what "should" be there based on context — report exactly what you see, digit by digit and letter by letter, even if it looks unusual or malformed.
+
+Return ONLY the raw string you read, no explanation, no quotes. If there is no such coordinate text visible anywhere on the label, return exactly: NONE`;
+
+    const messages = [{
+        role: 'user',
+        content: [
+            { type: 'image_url', image_url: { url: `data:${mimeType};base64,${base64}` } },
+            { type: 'text', text: prompt }
+        ]
+    }];
+    try {
+        const raw = await callAPI(VISION_MODEL, messages);
+        const cleaned = raw.trim().replace(/^["']|["']$/g, '');
+        return cleaned && cleaned.toUpperCase() !== 'NONE' ? cleaned : null;
+    } catch (e) {
+        console.warn('MGRS re-read pass failed:', e);
+        return null;
+    }
+}
+
+// Scans free-form OCR text for an MGRS-like token, tolerant of confusable
+// characters in the numeric portion (letters that commonly stand in for
+// digits — see MGRS.CONFUSABLE_TO_DIGIT), so it can spot e.g. "37MCKD182" or
+// "37M CK 0182" even before any correction is applied.
+function findMGRSInOCRText(ocrText) {
+    if (!ocrText) return null;
+    const clean = ocrText.toUpperCase();
+    const re = /(\d{1,2}\s?[C-XY]\s?[A-HJ-NP-Z]{2}\s?[0-9OQDILBSZGT]{4,12})/g;
+    const matches = [...clean.matchAll(re)];
+    if (matches.length === 0) return null;
+    // Prefer the longest match — the most complete-looking grid reference.
+    matches.sort((a, b) => b[0].length - a[0].length);
+    return matches[0][0].replace(/\s+/g, ' ').trim();
+}
+
+function logMGRSCrossValidation(mainValue, rereadValue, ocrValue) {
+    console.log('%c── MGRS field cross-validation ──────────────────────', 'color:#4a7fc1;font-weight:bold');
+    console.log('Main extraction pass:', mainValue || '(none)');
+    console.log('Narrow vision re-read:', rereadValue || '(not attempted / none found)');
+    console.log('OCR scan of full text:', ocrValue || '(not attempted / none found)');
+    const values = [mainValue, rereadValue, ocrValue].filter(Boolean).map(v => v.toUpperCase().replace(/\s+/g, ''));
+    const allAgree = values.length > 1 && values.every(v => v === values[0]);
+    if (values.length > 1 && !allAgree) {
+        console.warn('⚠️ MGRS readings DISAGREE across methods — recommend visually double-checking the label.');
+    } else if (allAgree) {
+        console.log('✅ All available MGRS readings agree.');
+    }
+    console.log('%c──────────────────────────────────────────────────────', 'color:#4a7fc1;font-weight:bold');
+}
+
+// Runs the full cross-validation: narrow vision re-read (if a base64 image is
+// available) + OCR regex scan (if OCR text is available), compares them
+// against the main extraction's value, and resolves a single "best" MGRS
+// candidate — preferring, in order: (1) a value that parses cleanly with NO
+// character-confusion correction needed, trying main → reread → ocr-scan in
+// that order; (2) failing that, the first candidate that parses even WITH
+// correction applied. Returns full diagnostic detail so the UI can show
+// exactly what was compared and why a given value won.
+async function crossValidateMGRS(mainValue, base64, mimeType, ocrText) {
+    let rereadValue = null;
+    if (base64) {
+        rereadValue = await rereadMGRSField(base64, mimeType);
+    }
+    const ocrValue = findMGRSInOCRText(ocrText);
+    logMGRSCrossValidation(mainValue, rereadValue, ocrValue);
+
+    const candidates = [
+        { label: 'main extraction', value: mainValue },
+        { label: 'narrow vision re-read', value: rereadValue },
+        { label: 'OCR scan', value: ocrValue }
+    ].filter(c => c.value);
+
+    let cleanMatch = null;
+    let correctedFallback = null;
+    for (const c of candidates) {
+        const parsed = MGRS.parseWithCorrection(c.value);
+        if (!parsed) continue;
+        if (!parsed.corrected) { cleanMatch = { ...c, parsed }; break; }
+        if (!correctedFallback) correctedFallback = { ...c, parsed };
+    }
+    const resolved = cleanMatch || correctedFallback || null;
+
+    const uniqueValues = [...new Set(candidates.map(c => c.value.toUpperCase().replace(/\s+/g, '')))];
+    const agreement = candidates.length <= 1 ? 'single-source' : (uniqueValues.length === 1 ? 'agree' : 'disagree');
+
+    return { mainValue, rereadValue, ocrValue, resolved, agreement, candidates };
 }
 
 // Normalizes the LLM's extraction output so the rest of the pipeline can rely
@@ -926,7 +1309,9 @@ function isStoplistedCandidate(candidate) {
     const norm = candidate.toLowerCase().replace(/[.,]/g, '').replace(/\s+/g, ' ').trim();
     return LOCALITY_STOPLIST.has(norm);
 }
+</script>
 
+<script>
 // ── Descriptive-sentence / non-locality fragment detection ───────────────────
 // Despite explicit prompt instructions to extract only place names (not full
 // sentences), the extraction model can still occasionally return a
@@ -1114,13 +1499,6 @@ function haversineKm(lat1, lon1, lat2, lon2) {
 }
 
 // ── Known landmark anchors ────────────────────────────────────────────────────
-// Large, unambiguous, well-known Kenyan landmarks with fixed reference
-// coordinates. If a locality candidate matches one of these (by name, case-
-// insensitive, allowing minor prefix/suffix variation like "Mt" vs "Mount"),
-// we use it as a trusted geographic anchor: a sanity-check radius around
-// which any other candidate's geocoded match must fall. This catches cases
-// like a small feature name ("Gamia") fuzzy-matching an unrelated place
-// hundreds of km away from the landmark the label actually describes.
 const KNOWN_ANCHORS = [
     { names: ['mount kenya', 'mt kenya', 'mt. kenya'], lat: -0.1521, lon: 37.3084, radiusKm: 60 },
     { names: ['mount elgon', 'mt elgon', 'mt. elgon'], lat: 1.1349, lon: 34.5582, radiusKm: 50 },
@@ -1145,57 +1523,20 @@ const KNOWN_ANCHORS = [
     { names: ['rift valley'], lat: 0.0000, lon: 36.0000, radiusKm: 250 },
 ];
 
-// Normalizes a candidate string for anchor matching: lowercase, strip
-// punctuation/extra whitespace.
 function normalizeForAnchorMatch(s) {
     return s.toLowerCase().replace(/[.,]/g, '').replace(/\s+/g, ' ').trim();
 }
 
-// Escapes a string for safe use inside a RegExp.
 function escapeRegExp(s) {
     return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
-// Checks whether a normalized locality candidate genuinely refers to a known
-// anchor name `n`. Two cases are allowed:
-//   1. Exact match (norm === n) — e.g. candidate "Mount Kenya" vs anchor "mount kenya"
-//   2. The anchor name appears as a whole word/phrase WITHIN the candidate
-//      (word-boundary matched) — e.g. candidate "Mount Kenya National Park"
-//      contains the anchor phrase "mount kenya" as complete words.
-//
-// IMPORTANT: this deliberately does NOT allow the reverse direction (anchor
-// name containing the candidate as a substring). That direction is what
-// previously caused a short, generic fragment like "Kenya" to falsely match
-// the anchor "mount kenya" — since the string "kenya" is trivially a
-// substring of "mount kenya" even though the candidate never actually named
-// that landmark. A short candidate being "inside" a longer anchor name is
-// not evidence of anything; only the reverse (the full anchor phrase
-// genuinely appearing in what was extracted) is meaningful.
 function candidateMatchesAnchorName(norm, n) {
     if (norm === n) return true;
     const re = new RegExp(`\\b${escapeRegExp(n)}\\b`);
     return re.test(norm);
 }
 
-// Looks through a list of locality candidates and finds every one that
-// matches a KNOWN_ANCHORS entry, then returns the match with the LARGEST
-// radius — i.e. the broadest, most general landmark found among the
-// candidates. Returns null if none of the candidates match a known landmark.
-//
-// Why largest radius and not first match: a label can legitimately mention
-// more than one recognizable landmark at once (e.g. both "Naro Moru", a
-// small town with a tight 20km radius, AND "Mount Kenya", a massif with a
-// 60km radius — Naro Moru sits on the mountain's western slopes). If the
-// smaller, tighter anchor were picked just because it appeared first in the
-// candidate list, it could end up rejecting a perfectly genuine match on the
-// larger, more authoritative landmark for being "too far" from the smaller
-// one — even though the larger one is actually the more reliable anchor and
-// was itself extracted from the same label. Preferring the broadest anchor
-// avoids one correct landmark's narrow radius vetoing another correct one.
-//
-// Candidates shorter than 4 characters (e.g. "Mt", "Ke") are skipped entirely
-// — they're too short to meaningfully confirm a landmark match and are more
-// likely to be OCR noise or stray fragments than an actual place reference.
 function findKnownAnchor(candidates) {
     let best = null; // { candidate, anchor }
     for (const candidate of candidates) {
@@ -1213,10 +1554,6 @@ function findKnownAnchor(candidates) {
 }
 
 // ── Strategy 1: GeoNames ──────────────────────────────────────────────────────
-// GeoNames has deep coverage of small Kenyan localities, villages, hills,
-// forests and rivers sourced from NGA/NIMA gazetteers — often finds places
-// that Nominatim misses entirely.
-// Simple Levenshtein distance for sanity-checking fuzzy geocode matches
 function levenshtein(a, b) {
     a = a.toLowerCase(); b = b.toLowerCase();
     const dp = Array.from({length: a.length + 1}, (_, i) => [i, ...Array(b.length).fill(0)]);
@@ -1231,19 +1568,6 @@ function levenshtein(a, b) {
     return dp[a.length][b.length];
 }
 
-// Returns true if `candidate` is plausibly an OCR/spelling variant of `query`
-// — short edit distance relative to string length, not a totally different name.
-//
-// The budget is intentionally tight: real OCR/handwriting misreads and minor
-// spelling variants of the SAME place are almost always 1, occasionally 2,
-// character edits (e.g. "Lolgories"→"Lolgorien" is 1 edit; "Mangea"→"Mwangea"
-// is 1 edit). A looser, length-scaled budget (e.g. ~35% of length) also lets
-// through edits that land on a completely different, unrelated place that
-// merely happens to be similar length and share some letters (e.g.
-// "Machanoa"→"Machakos" is 2 edits on an 8-letter word and clears a 35%
-// budget, but Machakos is a real, different town ~150km away — not a misread
-// of "Machanoa"). Short words (≤6 chars) get only a 1-edit budget, since a
-// 2-edit budget on something that short is a large fraction of the string.
 function isPlausibleMatch(query, candidate) {
     const dist = levenshtein(query, candidate);
     const maxLen = Math.max(query.length, candidate.length);
@@ -1252,26 +1576,6 @@ function isPlausibleMatch(query, candidate) {
 }
 
 async function geocodeGeoNames(locality, allowFuzzy = true, disambiguationHints = []) {
-    // Try multiple GeoNames strategies, from exact to fuzzy:
-    // (a) searchJSON — full-text search, country-restricted to Kenya
-    // (b) searchJSON with name= exact field match
-    // (c) fuzzy=0.6 — Levenshtein-based fuzzy match, tolerates OCR noise like
-    //     "Lolgories" vs "Lolgorien" (transposed/substituted letters)
-    // (d) name_startsWith — prefix match, catches truncated reads
-    // When allowFuzzy is false, only (a) and (b) — the exact-style endpoints —
-    // are tried. This lets the caller run an exact pass across ALL candidates
-    // before any candidate is allowed to fuzzy-match anything, so a vague or
-    // garbled small-feature name can't "win" via fuzzy match ahead of a clean
-    // exact match on a better candidate (e.g. a well-known landmark).
-    //
-    // disambiguationHints: normalized county names (e.g. ['narok']) extracted
-    // from OTHER candidates on the same label. Some real Kenyan place names
-    // are genuinely ambiguous — most notably "Ewaso Nyiro", which names two
-    // distinct, unrelated rivers in different parts of the country. When a
-    // query returns multiple in-Kenya, name-plausible results, we don't just
-    // take the first one: if any result's adminName1 (county) matches a
-    // disambiguation hint, that result is preferred. Only if no hint matches
-    // anything do we fall back to "first result", exactly as before.
     const base = `https://secure.geonames.org/searchJSON?country=KE&maxRows=5&lang=en&username=${GEONAMES_USER}`;
     let endpoints = [
         { label: 'q (full-text)',      url: `${base}&q=${encodeURIComponent(locality)}`, requireSimilar: false, fuzzy: false },
@@ -1286,10 +1590,6 @@ async function geocodeGeoNames(locality, allowFuzzy = true, disambiguationHints 
             const res  = await fetch(url);
             const data = await res.json();
             if (data.geonames && data.geonames.length > 0) {
-                // Collect every candidate result that's in Kenya and (for
-                // fuzzy/prefix endpoints) plausible, before picking one —
-                // rather than returning on the very first match — so we can
-                // check ALL of them against the disambiguation hints.
                 const validResults = [];
                 for (const place of data.geonames) {
                     const lat = parseFloat(place.lat);
@@ -1332,18 +1632,11 @@ async function geocodeGeoNames(locality, allowFuzzy = true, disambiguationHints 
     return null;
 }
 
-// ── Strategy 2: Nominatim (OpenStreetMap) ─────────────────────────────────────
-// Good for towns, roads, parks and OSM-mapped features. Used as fallback when
-// GeoNames cannot find the locality.
 async function geocodeNominatim(locality, allowFuzzy = true, disambiguationHints = []) {
     const kenyaViewbox = '33.9,-4.7,41.9,5.0';
     let queries = [
-        // Strict Kenya country code — treated as "exact" since it's tightly scoped
         { label: 'countrycodes=ke', url: `https://nominatim.openstreetmap.org/search?format=json&q=${encodeURIComponent(locality + ', Kenya')}&countrycodes=ke&limit=3`, fuzzy: false },
-        // Viewbox-bounded (catches places not tagged as KE in OSM) — still scoped, treated as exact
         { label: 'viewbox bounded',  url: `https://nominatim.openstreetmap.org/search?format=json&q=${encodeURIComponent(locality)}&viewbox=${kenyaViewbox}&bounded=1&limit=3`, fuzzy: false },
-        // Unbounded — no geographic scoping at all until results are filtered by
-        // bbox after the fact, so this is the riskiest tier and counts as fuzzy.
         { label: 'unbounded',        url: `https://nominatim.openstreetmap.org/search?format=json&q=${encodeURIComponent(locality)}&limit=5`, fuzzy: true }
     ];
     if (!allowFuzzy) queries = queries.filter(q => !q.fuzzy);
@@ -1360,10 +1653,6 @@ async function geocodeNominatim(locality, allowFuzzy = true, disambiguationHints
             }
             if (validResults.length === 0) continue;
 
-            // Same disambiguation logic as geocodeGeoNames: Nominatim has no
-            // separate county field, but display_name includes the region as
-            // a comma-separated component, so we check whether any hint
-            // appears anywhere in that string.
             let chosen = validResults[0];
             let disambiguatedVia = null;
             if (disambiguationHints.length > 0 && validResults.length > 1) {
@@ -1395,12 +1684,6 @@ async function geocodeNominatim(locality, allowFuzzy = true, disambiguationHints
     return null;
 }
 
-// ── Main geocode: GeoNames → Nominatim ───────────────────────────────────────
-// Breaks a compound locality string into ordered candidate search terms.
-// Handles patterns like:
-//   "Lamu (Kiunga Shops)"      → ["Kiunga Shops", "Kiunga", "Lamu", "Lamu (Kiunga Shops)"]
-//   "Nong Hills, W of Kiserian" → ["Nong Hills", "Kiserian", "Nong Hills, W of Kiserian"]
-//   "Ngong Hills area"          → ["Ngong Hills", "Ngong", "Ngong Hills area"]
 function extractLocalityVariants(locality) {
     const variants = [];
     const seen = new Set();
@@ -1409,135 +1692,62 @@ function extractLocalityVariants(locality) {
         if (t && !seen.has(t.toLowerCase())) { seen.add(t.toLowerCase()); variants.push(t); }
     };
 
-    // Defensive guard: if this string is itself a descriptive sentence
-    // (e.g. "small hill at the western side of Ngong hills") rather than a
-    // place name — which should normally have been filtered out already by
-    // normalizeExtracted(), but is checked again here in case this function
-    // is ever called directly with unfiltered input — skip the bare-prefix
-    // extraction step below entirely. That step assumes its input is a short
-    // place name where "the first word" is meaningful (e.g. "Ngong" from
-    // "Ngong Hills"); applied to a sentence, it instead extracts a random
-    // leading word (e.g. "small") and sends it to the geocoder as if it were
-    // a place name, which can silently match an unrelated real place.
     const looksDescriptive = isDescriptiveFragment(locality);
     if (looksDescriptive) {
         add(locality);
         return variants;
     }
 
-    // 1. Content inside parentheses — usually the most specific named place
-    //    e.g. "Lamu (Kiunga Shops)" → "Kiunga Shops"
     const parenMatch = locality.match(/\(([^)]+)\)/);
     if (parenMatch) {
         add(parenMatch[1]);
-        // Also try just the first word of the parenthetical (e.g. "Kiunga" from "Kiunga Shops")
         const firstWord = parenMatch[1].trim().split(/\s+/)[0];
         if (firstWord.length > 2) add(firstWord);
     }
 
-    // 2. Content before parentheses — usually the broader area/county
-    //    e.g. "Lamu (Kiunga Shops)" → "Lamu"
     const beforeParen = locality.split('(')[0].trim();
     if (beforeParen && beforeParen !== locality) add(beforeParen);
 
-    // 3. Split on common separators: comma, "W of", "E of", "N of", "S of", "along", "near"
     const parts = locality
-        .replace(/\([^)]*\)/g, '') // strip parens content already tried
+        .replace(/\([^)]*\)/g, '')
         .split(/,|\bW of\b|\bE of\b|\bN of\b|\bS of\b|\balong\b|\bnear\b/i)
         .map(p => p.trim())
         .filter(p => p.length > 2);
     parts.forEach(add);
 
-    // 4. Strip generic suffixes like "Hills", "area", "shops", "Road", "Rd" to get bare place name
-    //    e.g. "Ngong Hills" → "Ngong", "Nong Hills area" → "Nong"
     const stripped = locality.match(/^([A-Za-z\u00C0-\u017F]+)/);
     if (stripped) {
         const bare = stripped[1].trim();
         if (bare.length > 2) add(bare);
     }
 
-    // 5. Full original string as last resort
     add(locality);
 
     return variants;
 }
 
-// ── Generic geographic feature word detection ─────────────────────────────────
-// Some locality candidates are just a bare geographic feature word (or a
-// feature word + another feature word), with no actual proper name attached
-// — e.g. "Mara river", "Mara" (river name used alone), "Hills area". These
-// often DO exist as exact GeoNames entries (e.g. "Mara Serena Airport" for
-// "Mara"), but an exact hit on a generic word is not evidence that it's the
-// right place for THIS specimen — it's just a common word that happens to
-// also be part of an unrelated place's name. A real, deliberately-named
-// locality (even if it needs a fuzzy/spelling correction, e.g. "Lolgories"
-// for "Lolgorien") should be preferred over an exact-but-generic hit.
 const GENERIC_FEATURE_WORDS = new Set([
     'river', 'mara', 'hill', 'hills', 'valley', 'forest', 'area', 'road',
     'ridge', 'stream', 'lake', 'mountain', 'mount', 'peak', 'peaks',
     'plain', 'plains', 'falls', 'springs', 'swamp', 'gorge', 'escarpment'
 ]);
 
-// A candidate counts as "generic" only if EVERY word in it is itself a bare
-// feature word — e.g. "Mara river" → ["mara","river"], both generic. A real
-// named place like "Naro Moru" or "Gamia Peaks" has at least one word that
-// isn't a generic feature term, so it's treated as specific even though it
-// may also contain a feature word like "Peaks".
 function isGenericCandidate(candidate) {
     const words = candidate.toLowerCase().trim().split(/\s+/).filter(Boolean);
     if (words.length === 0) return true;
     return words.every(w => GENERIC_FEATURE_WORDS.has(w));
 }
 
-
-//
-// This replaces the old "one locality string in, fuzzy-fallback through its
-// variants" approach. Herbarium labels often carry SEVERAL place names of
-// very different reliability (a small peak/valley/ridge name plus a large,
-// well-known landmark, plus sometimes a bare generic feature word like a
-// river name). Treating "most specific" or "first extracted" as "best" let
-// two different failure modes through:
-//   (a) a vague/garbled small-feature name fuzzy-matched an unrelated place
-//       far from the landmark the label actually describes (the Gamba case)
-//   (b) a bare generic word (e.g. "Mara") returned a real but WRONG exact
-//       GeoNames hit, pre-empting a real, specifically-named locality that
-//       only needed a fuzzy spelling correction to resolve correctly (the
-//       Lolgorien case)
-//
-// Strategy — four strict tiers, run in this order, each only attempted if
-// every earlier tier found nothing acceptable:
-//   1. EXACT match, over NON-GENERIC (specifically-named) candidates only.
-//   2. FUZZY match, over NON-GENERIC candidates only — but instead of
-//      returning the first hit found, every fuzzy hit across every
-//      non-generic candidate's variants is collected and scored by
-//      normalized edit distance to its own query term, and the BEST
-//      (closest spelling) match wins. This is what lets "Lolgories" beat
-//      out a worse fuzzy hit from another candidate just because that
-//      other candidate happened to be tried first.
-//   3. EXACT match, over GENERIC candidates (bare feature words) — only
-//      reached if no real named candidate resolved at all.
-//   4. FUZZY match, over GENERIC candidates — last resort.
-// A KNOWN_ANCHOR (e.g. "Mount Kenya"), if present among the candidates, is
-// used throughout as a distance sanity check: any match (in any tier) that
-// lands implausibly far from the anchor is rejected and the search moves on.
 async function geocodeCandidates(candidates) {
     if (!candidates || candidates.length === 0) return null;
 
-    // ── Step 0: extract disambiguation hints (county/district names) ───────
-    // A county/district name mentioned anywhere on the label (e.g. "Narok
-    // District") isn't itself geocoded as a locality — it's too broad to be
-    // useful as "the" specimen location — but it IS used to disambiguate
-    // OTHER candidates that share a name with more than one real place (the
-    // clearest case being "Ewaso Nyiro", which names two distinct rivers in
-    // different counties).
     const disambiguationHints = extractDisambiguationHints(candidates);
     if (disambiguationHints.length > 0) {
         console.log('🗺️ Disambiguation hints found on label (county/district names):', disambiguationHints);
         if (geocodeLog) geocodeLog.disambiguationHints = disambiguationHints;
     }
 
-    // ── Step 1: anchor detection ────────────────────────────────────────────
-    let anchorPoint = null; // { lat, lon, radiusKm, label }
+    let anchorPoint = null;
     const foundAnchor = findKnownAnchor(candidates);
     if (foundAnchor) {
         console.log(`📍 Known landmark anchor detected in candidates: "${foundAnchor.candidate}" → using as reference point (${foundAnchor.anchor.lat}, ${foundAnchor.anchor.lon}, radius ${foundAnchor.anchor.radiusKm}km)`);
@@ -1557,8 +1767,6 @@ async function geocodeCandidates(candidates) {
         console.log('No known landmark anchor found among candidates — proceeding without a distance sanity check.');
     }
 
-    // Helper: checks a geocode result against the active anchor (if any).
-    // Returns true if acceptable (no anchor, or within radius).
     function passesAnchorCheck(result, term) {
         if (!anchorPoint) return true;
         const distKm = haversineKm(anchorPoint.lat, anchorPoint.lon, result.lat, result.lon);
@@ -1574,7 +1782,6 @@ async function geocodeCandidates(candidates) {
         return false;
     }
 
-    // ── Step 2: split candidates into specific vs. generic, build term sets ──
     const specificCandidates = candidates.filter(c => !isGenericCandidate(c));
     const genericCandidates  = candidates.filter(c =>  isGenericCandidate(c));
     if (geocodeLog) {
@@ -1596,17 +1803,16 @@ async function geocodeCandidates(candidates) {
         });
     }
 
-    // ── Tier 1: EXACT match over specific candidates only ───────────────────
     const specificTermSets = buildTermSets(specificCandidates);
     console.log('── Tier 1: exact match, specifically-named candidates ──');
     for (const { candidate, terms } of specificTermSets) {
         for (const term of terms) {
-            const geoResult = await geocodeGeoNames(term, /* allowFuzzy */ false, disambiguationHints);
+            const geoResult = await geocodeGeoNames(term, false, disambiguationHints);
             if (geoResult && passesAnchorCheck(geoResult, term)) {
                 console.log(`✅ [exact-specific] GeoNames matched "${term}" (from candidate "${candidate}"): ${geoResult.display}`);
                 return { ...geoResult, matchedTerm: term, matchTier: 'exact-specific' };
             }
-            const nomResult = await geocodeNominatim(term, /* allowFuzzy */ false, disambiguationHints);
+            const nomResult = await geocodeNominatim(term, false, disambiguationHints);
             if (nomResult && passesAnchorCheck(nomResult, term)) {
                 console.log(`✅ [exact-specific] Nominatim matched "${term}" (from candidate "${candidate}"): ${nomResult.display}`);
                 return { ...nomResult, matchedTerm: term, matchTier: 'exact-specific' };
@@ -1614,18 +1820,11 @@ async function geocodeCandidates(candidates) {
         }
     }
 
-    // ── Tier 2: FUZZY match over specific candidates, BEST-SCORE wins ──────
-    // Unlike tier 1, we don't return on first hit. We collect every fuzzy hit
-    // across every specific candidate's terms, score each by normalized edit
-    // distance (how close the matched name is to the term that found it),
-    // and keep only the best (lowest-distance) one. This prevents a worse
-    // fuzzy match on an earlier-tried candidate from beating a better fuzzy
-    // match on a later candidate purely due to ordering.
     console.log('── Tier 2: fuzzy match, specifically-named candidates (best score wins) ──');
-    let bestFuzzy = null; // { result, term, candidate, score }
+    let bestFuzzy = null;
     for (const { candidate, terms } of specificTermSets) {
         for (const term of terms) {
-            const geoResult = await geocodeGeoNames(term, /* allowFuzzy */ true, disambiguationHints);
+            const geoResult = await geocodeGeoNames(term, true, disambiguationHints);
             if (geoResult && passesAnchorCheck(geoResult, term)) {
                 const score = levenshtein(term.toLowerCase(), (geoResult.matchedName || geoResult.display || '').toLowerCase())
                     / Math.max(term.length, (geoResult.matchedName || geoResult.display || term).length, 1);
@@ -1634,7 +1833,7 @@ async function geocodeCandidates(candidates) {
                     bestFuzzy = { result: geoResult, term, candidate, score, source: 'GeoNames' };
                 }
             }
-            const nomResult = await geocodeNominatim(term, /* allowFuzzy */ true, disambiguationHints);
+            const nomResult = await geocodeNominatim(term, true, disambiguationHints);
             if (nomResult && passesAnchorCheck(nomResult, term)) {
                 const matchedShortName = (nomResult.display || '').split(',')[0];
                 const score = levenshtein(term.toLowerCase(), matchedShortName.toLowerCase())
@@ -1651,18 +1850,16 @@ async function geocodeCandidates(candidates) {
         return { ...bestFuzzy.result, matchedTerm: bestFuzzy.term, matchTier: 'fuzzy-specific' };
     }
 
-    // ── Tier 3: EXACT match over generic candidates ─────────────────────────
-    // Only reached if no real named candidate resolved at all.
     const genericTermSets = buildTermSets(genericCandidates);
     console.log('── Tier 3: exact match, bare generic candidates (last resort before fuzzy-generic) ──');
     for (const { candidate, terms } of genericTermSets) {
         for (const term of terms) {
-            const geoResult = await geocodeGeoNames(term, /* allowFuzzy */ false, disambiguationHints);
+            const geoResult = await geocodeGeoNames(term, false, disambiguationHints);
             if (geoResult && passesAnchorCheck(geoResult, term)) {
                 console.log(`✅ [exact-generic] GeoNames matched "${term}" (from candidate "${candidate}"): ${geoResult.display}`);
                 return { ...geoResult, matchedTerm: term, matchTier: 'exact-generic' };
             }
-            const nomResult = await geocodeNominatim(term, /* allowFuzzy */ false, disambiguationHints);
+            const nomResult = await geocodeNominatim(term, false, disambiguationHints);
             if (nomResult && passesAnchorCheck(nomResult, term)) {
                 console.log(`✅ [exact-generic] Nominatim matched "${term}" (from candidate "${candidate}"): ${nomResult.display}`);
                 return { ...nomResult, matchedTerm: term, matchTier: 'exact-generic' };
@@ -1670,16 +1867,15 @@ async function geocodeCandidates(candidates) {
         }
     }
 
-    // ── Tier 4: FUZZY match over generic candidates — absolute last resort ──
     console.log('── Tier 4: fuzzy match, bare generic candidates (absolute last resort) ──');
     for (const { candidate, terms } of genericTermSets) {
         for (const term of terms) {
-            const geoResult = await geocodeGeoNames(term, /* allowFuzzy */ true, disambiguationHints);
+            const geoResult = await geocodeGeoNames(term, true, disambiguationHints);
             if (geoResult && passesAnchorCheck(geoResult, term)) {
                 console.log(`✅ [fuzzy-generic] GeoNames matched "${term}" (from candidate "${candidate}"): ${geoResult.display}`);
                 return { ...geoResult, matchedTerm: term, matchTier: 'fuzzy-generic' };
             }
-            const nomResult = await geocodeNominatim(term, /* allowFuzzy */ true, disambiguationHints);
+            const nomResult = await geocodeNominatim(term, true, disambiguationHints);
             if (nomResult && passesAnchorCheck(nomResult, term)) {
                 console.log(`✅ [fuzzy-generic] Nominatim matched "${term}" (from candidate "${candidate}"): ${nomResult.display}`);
                 return { ...nomResult, matchedTerm: term, matchTier: 'fuzzy-generic' };
@@ -1687,15 +1883,6 @@ async function geocodeCandidates(candidates) {
         }
     }
 
-    // ── Step 3: nothing resolved within an acceptable distance ─────────────
-    // IMPORTANT: we do NOT fall back to the anchor's own coordinates here.
-    // An anchor exists only to REJECT matches that are implausibly far away —
-    // it is a sanity check, not a substitute answer. Returning the anchor's
-    // own point when nothing else qualifies would silently produce a low-
-    // precision, possibly misleading location (e.g. a generic country-level
-    // or landmark-level point standing in for a specific locality that was
-    // never actually resolved). It's better to surface "not found" to the
-    // user than to quietly hand back a wrong-but-plausible-looking coordinate.
     if (anchorPoint && geocodeLog && geocodeLog.rejectedMatches && geocodeLog.rejectedMatches.length > 0) {
         console.warn(`❌ No candidate resolved within ${anchorPoint.radiusKm}km of anchor "${anchorPoint.label}". Not falling back to the anchor's own coordinates — reporting as unresolved instead.`);
     }
@@ -1704,22 +1891,67 @@ async function geocodeCandidates(candidates) {
     return null;
 }
 
-
-// Backward-compatible single-string wrapper, kept for any external callers
-// still passing one locality string instead of a candidates array.
 async function geocode(locality) {
     return geocodeCandidates([locality]);
 }
+</script>
 
+<script>
 // ─── UI helpers ───────────────────────────────────────────────────────────────
 function setStep(id, state) {
     const el = document.getElementById(id);
+    if (!el) return;
     el.className = 'progress-step ' + state;
 }
 
-function showResults(extracted, coords, calcMGRS, method, originalLocality) {
+function renderCrossCheckCard(crossCheck) {
+    const wrap = document.getElementById('crosscheckWrap');
+    const card = document.getElementById('crosscheckCard');
+    if (!crossCheck || crossCheck.candidates.length === 0) {
+        wrap.style.display = 'none';
+        card.innerHTML = '';
+        return;
+    }
+    wrap.style.display = 'block';
+
+    const rows = [
+        ['Main extraction', crossCheck.mainValue],
+        ['Vision re-read', crossCheck.rereadValue],
+        ['OCR scan', crossCheck.ocrValue]
+    ].filter(([, v]) => v !== null && v !== undefined)
+     .map(([label, v]) => `<div class="crosscheck-row"><span>${label}</span><span>${v}</span></div>`)
+     .join('');
+
+    let cls, title, body;
+    if (crossCheck.agreement === 'agree') {
+        cls = 'agree';
+        title = '✓ Readings agree';
+        body = 'Every available reading of the coordinate field matched.';
+    } else if (crossCheck.agreement === 'disagree') {
+        cls = 'disagree';
+        title = '⚠ Readings disagree — resolved automatically, please verify';
+        const resolvedNote = crossCheck.resolved
+            ? `Used the "${crossCheck.resolved.label}" reading${crossCheck.resolved.parsed.corrected ? ` (with character correction: ${crossCheck.resolved.parsed.correctionsApplied.join(', ')})` : ''} since it parsed cleanly.`
+            : 'None of the readings could be parsed as valid MGRS — manual review needed.';
+        body = resolvedNote;
+    } else {
+        cls = 'partial';
+        title = 'Single reading only';
+        body = 'Only one method produced a coordinate reading, so there was nothing to cross-check it against.';
+    }
+
+    card.innerHTML = `<div class="crosscheck-card ${cls}">
+        <div style="font-weight:500">${title}</div>
+        <div style="margin-top:4px">${body}</div>
+        ${rows}
+    </div>`;
+}
+
+function showResults(extracted, coords, calcMGRS, method, originalLocality, convertedMGRS, crossCheck) {
     document.getElementById('emptyState').style.display = 'none';
     document.getElementById('resultsAll').classList.add('visible');
+
+    renderCrossCheckCard(crossCheck);
 
     document.getElementById('rSpecies').innerHTML   = extracted.species_name   || '<span style="color:#8a9a8a;font-style:italic;font-family:Inter,sans-serif">not found</span>';
     document.getElementById('rAuthor').innerHTML    = extracted.author_citation || '<span style="color:#8a9a8a;font-style:italic;font-family:Inter,sans-serif">not found</span>';
@@ -1733,10 +1965,51 @@ function showResults(extracted, coords, calcMGRS, method, originalLocality) {
     document.getElementById('rMethod').innerText    = method;
     document.getElementById('rGeoSource').innerText = coords ? coords.source : '—';
 
-    // Locality actually used for geocoding — the specific candidate/variant
-    // string that produced the successful geocode hit, not just the raw
-    // top-of-label locality. Falls back to a clear "not resolved" message
-    // when no candidate could be geocoded at all.
+    // ── MGRS already present on the label AND successfully parsed: AL → AA
+    // scheme conversion path ─────────────────────────────────────────────
+    if (convertedMGRS && convertedMGRS.full) {
+        document.getElementById('rGeoSource').innerText = 'not used — MGRS present on label';
+        document.getElementById('rowLocalityCorrected').style.display = 'none';
+        document.getElementById('rLocalityUsed').innerHTML =
+            '<span style="color:#8a9a8a;font-style:italic;font-family:Inter,sans-serif">geocoding skipped — MGRS present on label</span>';
+        document.getElementById('rLatLon').innerText   = 'Not calculated — geocoding skipped';
+        document.getElementById('rCalcMGRS').innerText = '—';
+
+        const correctionNote = convertedMGRS.corrected
+            ? `<br><br><strong>Character-confusion correction applied:</strong> ${convertedMGRS.correctionsApplied.join(', ')} within the numeric easting/northing digits before parsing (common OCR/vision misreads of digits as similar-looking letters).`
+            : '';
+
+        const vCard = document.getElementById('validationCard');
+        if (convertedMGRS.full === extracted.mgrs_coordinates.toUpperCase().replace(/\s+/g, ' ').trim()) {
+            vCard.innerHTML = `<div class="validation-card pass">
+                <div class="validation-title">Already in AA scheme</div>
+                <div class="validation-body">
+                    The recorded MGRS <strong>${extracted.mgrs_coordinates}</strong> maps to itself under the
+                    AL → AA row-letter shift, so it was already expressed in the current AA scheme.
+                    Geocoding was skipped since coordinates were already present on the label.${correctionNote}
+                </div>
+            </div>`;
+        } else {
+            vCard.innerHTML = `<div class="validation-card info">
+                <div class="validation-title">Converted from AL to AA scheme</div>
+                <div class="validation-body">
+                    Recorded MGRS <strong>${extracted.mgrs_coordinates}</strong> was treated as the legacy AL
+                    100&nbsp;km-square lettering scheme and converted directly to the current AA scheme
+                    (<strong>${convertedMGRS.full}</strong>) — the row letter was shifted 10 places; the column
+                    letter and numeric easting/northing digits were left unchanged.
+                    Geocoding was skipped since coordinates were already present on the label.${correctionNote}
+                </div>
+            </div>`;
+        }
+
+        document.getElementById('finalMGRS').innerText = convertedMGRS.full;
+        document.getElementById('finalNote').innerText  = convertedMGRS.corrected
+            ? 'AL → AA scheme conversion (character-confusion correction applied, no geocoding performed)'
+            : 'AL → AA scheme conversion (no geocoding performed)';
+        document.getElementById('methodBadge').innerText = method;
+        return;
+    }
+
     const localityUsedEl = document.getElementById('rLocalityUsed');
     if (coords) {
         const usedTerm = coords.matchedTerm || extracted.locality || '—';
@@ -1745,7 +2018,6 @@ function showResults(extracted, coords, calcMGRS, method, originalLocality) {
         localityUsedEl.innerHTML = '<span style="color:#8a9a8a;font-style:italic;font-family:Inter,sans-serif">not resolved</span>';
     }
 
-    // Show corrected locality row only if it actually changed
     if (extracted.locality && originalLocality && extracted.locality !== originalLocality) {
         document.getElementById('rLocalityCorrected').innerText = extracted.locality;
         document.getElementById('rowLocalityCorrected').style.display = 'grid';
@@ -1763,6 +2035,8 @@ function showResults(extracted, coords, calcMGRS, method, originalLocality) {
         document.getElementById('rCalcMGRS').innerText = '—';
     }
 
+    const mgrsParseFailed = !!(extracted.mgrs_coordinates && !(convertedMGRS && convertedMGRS.full));
+
     const vCard = document.getElementById('validationCard');
     let finalMGRS = calcMGRS ? calcMGRS.full : '—';
     let finalNote = 'calculated from locality';
@@ -1771,45 +2045,64 @@ function showResults(extracted, coords, calcMGRS, method, originalLocality) {
         vCard.innerHTML = `<div class="validation-card fail"><div class="validation-title">No coordinates or locality found</div><div class="validation-body">The label contains neither an MGRS reference nor a recognisable place name. Check image quality and try again.</div></div>`;
         finalMGRS = '—';
         finalNote = 'insufficient data on label';
+    } else if (!coords && mgrsParseFailed) {
+        const candidateListStr = candidateList.length > 0 ? `"${candidateList.join('", "')}"` : 'the extracted locality candidates';
+        vCard.innerHTML = `<div class="validation-card fail">
+            <div class="validation-title">Recorded MGRS unparseable, and locality not found</div>
+            <div class="validation-body">
+                The recorded value <strong>${extracted.mgrs_coordinates}</strong> does not match the expected
+                MGRS pattern even after attempting character-confusion correction (zone + band + 100&nbsp;km
+                square + easting/northing digits), so geocoding was attempted as a fallback. However, none of
+                ${candidateListStr} could be matched to a location within Kenya either. Check the recorded MGRS
+                and locality against the label image — manual correction may be needed.
+            </div>
+        </div>`;
+        finalMGRS = '—';
+        finalNote = 'recorded MGRS unparseable and locality geocoding also failed';
     } else if (!coords && !extracted.mgrs_coordinates) {
-        const candidateList = extracted.locality_candidates || [];
-        const localityStr = candidateList.length > 0 ? `"${candidateList.join('", "')}"` : 'the extracted locality candidates';
-        vCard.innerHTML = `<div class="validation-card fail"><div class="validation-title">Locality not found in Kenya</div><div class="validation-body">None of ${localityStr} could be matched to a location within Kenya. The place names may be misspelled, too vague, or outside Kenya's boundaries.</div></div>`;
+        const candidateListStr = candidateList.length > 0 ? `"${candidateList.join('", "')}"` : 'the extracted locality candidates';
+        vCard.innerHTML = `<div class="validation-card fail"><div class="validation-title">Locality not found in Kenya</div><div class="validation-body">None of ${candidateListStr} could be matched to a location within Kenya. The place names may be misspelled, too vague, or outside Kenya's boundaries.</div></div>`;
         finalMGRS = '—';
         finalNote = 'geocoding failed — no locality candidate resolved';
-    } else if (!extracted.mgrs_coordinates) {
+    } else if (!extracted.mgrs_coordinates || mgrsParseFailed) {
         const placeLabel = coords.display ? coords.display.split(',')[0] : (coords.matchedTerm || extracted.locality);
         const matchedVia = coords.matchedTerm && coords.matchedTerm !== extracted.locality
             ? ` (matched via candidate "<strong>${coords.matchedTerm}</strong>")` : '';
-        vCard.innerHTML = `<div class="validation-card info"><div class="validation-title">No MGRS on label — derived from locality</div><div class="validation-body">No MGRS grid reference was found on the label. Locality candidate <strong>"${coords.matchedTerm || extracted.locality}"</strong> was geocoded to <strong>${coords.lat.toFixed(4)}°, ${coords.lon.toFixed(4)}°</strong> (matched: ${placeLabel})${matchedVia} and converted to MGRS.</div></div>`;
-        finalNote = 'no MGRS on label — derived from locality geocode';
+        const parseFailNote = mgrsParseFailed
+            ? ` The recorded value "<strong>${extracted.mgrs_coordinates}</strong>" on the label could not be parsed as valid MGRS even with character-confusion correction, so it was set aside in favor of this geocoded result.`
+            : '';
+        const title = mgrsParseFailed ? 'Recorded MGRS unparseable — derived from locality' : 'No MGRS on label — derived from locality';
+        vCard.innerHTML = `<div class="validation-card info"><div class="validation-title">${title}</div><div class="validation-body">Locality candidate <strong>"${coords.matchedTerm || extracted.locality}"</strong> was geocoded to <strong>${coords.lat.toFixed(4)}°, ${coords.lon.toFixed(4)}°</strong> (matched: ${placeLabel})${matchedVia} and converted to MGRS.${parseFailNote}</div></div>`;
+        finalNote = mgrsParseFailed ? 'recorded MGRS unparseable — derived from locality geocode instead' : 'no MGRS on label — derived from locality geocode';
     } else if (!coords) {
         vCard.innerHTML = `<div class="validation-card info"><div class="validation-title">MGRS present — locality unresolved</div><div class="validation-body">An MGRS value was found on the label but the locality could not be geocoded within Kenya, so cross-validation was not possible. Using recorded MGRS.</div></div>`;
         finalMGRS = extracted.mgrs_coordinates;
         finalNote = 'recorded MGRS used — locality unresolved';
     } else {
-        const recPrefix  = MGRS.parsePrefix(extracted.mgrs_coordinates);
+        const recParsed  = MGRS.parseWithCorrection(extracted.mgrs_coordinates);
+        const recPrefix  = recParsed ? recParsed.prefix : null;
         const calcPrefix = MGRS.parsePrefix(calcMGRS.full);
+        const recCorrectionNote = (recParsed && recParsed.corrected)
+            ? ` (character correction applied to recorded value: ${recParsed.correctionsApplied.join(', ')})`
+            : '';
 
         if (!recPrefix) {
-            vCard.innerHTML = `<div class="validation-card fail"><div class="validation-title">Could not parse recorded MGRS</div><div class="validation-body">The recorded value <strong>${extracted.mgrs_coordinates}</strong> does not appear to be a valid MGRS string.</div></div>`;
+            vCard.innerHTML = `<div class="validation-card fail"><div class="validation-title">Could not parse recorded MGRS</div><div class="validation-body">The recorded value <strong>${extracted.mgrs_coordinates}</strong> does not appear to be a valid MGRS string, even after attempting character-confusion correction.</div></div>`;
             finalNote = 'recorded MGRS unparseable';
         } else if (recPrefix.zone === calcPrefix.zone &&
                    recPrefix.band === calcPrefix.band &&
                    recPrefix.square === calcPrefix.square) {
-            // Zone, band and 100km square all match — recorded MGRS is correct
             vCard.innerHTML = `<div class="validation-card pass">
                 <div class="validation-title">Validation passed</div>
                 <div class="validation-body">
                     Grid zone designator <strong>${recPrefix.zone}${recPrefix.band}</strong> and
                     100 km square <strong>${recPrefix.square}</strong> both match the calculated position.
-                    Recorded MGRS is consistent with the locality.
+                    Recorded MGRS is consistent with the locality.${recCorrectionNote}
                 </div>
             </div>`;
             finalMGRS = extracted.mgrs_coordinates;
-            finalNote = 'recorded MGRS validated against locality';
+            finalNote = 'recorded MGRS validated against locality' + (recParsed && recParsed.corrected ? ' (with character correction)' : '');
         } else {
-            // Mismatch — build corrected MGRS: calculated zone/band/square + recorded numerics
             const corrected = MGRS.correctMGRS(
                 extracted.mgrs_coordinates,
                 calcPrefix.zone, calcPrefix.band, calcPrefix.square
@@ -1830,7 +2123,7 @@ function showResults(extracted, coords, calcMGRS, method, originalLocality) {
                 <div class="validation-body">
                     ${mismatchDetail.join('<br>')}.<br><br>
                     The numeric easting/northing digits from the recorded MGRS have been preserved.
-                    Only the grid zone designator and 100 km square have been corrected.
+                    Only the grid zone designator and 100 km square have been corrected.${recCorrectionNote}
                 </div>
             </div>`;
             finalNote = `corrected prefix ${recPrefix.zone}${recPrefix.band} ${recPrefix.square} → ${calcPrefix.zone}${calcPrefix.band} ${calcPrefix.square} · numerics preserved`;
@@ -1841,42 +2134,56 @@ function showResults(extracted, coords, calcMGRS, method, originalLocality) {
     document.getElementById('finalNote').innerText  = finalNote;
     document.getElementById('methodBadge').innerText = method;
 }
+</script>
 
+<script>
 // ─── Main processing pipeline ─────────────────────────────────────────────────
 async function processFile(file) {
     // Reset UI
     document.getElementById('progressWrap').style.display = 'block';
     document.getElementById('emptyState').style.display   = 'none';
     document.getElementById('resultsAll').classList.remove('visible');
-    ['step-vision','step-ocr','step-spell','step-geocode','step-convert','step-validate'].forEach(s => setStep(s,''));
+    document.getElementById('crosscheckWrap').style.display = 'none';
+    ['step-vision','step-ocr','step-crosscheck','step-spell','step-geocode','step-convert','step-validate'].forEach(s => setStep(s,''));
 
     let extracted = null;
     let method = '';
-    let base64 = null;
-    const mimeType = file.type || 'image/jpeg';
+    let base64 = null;          // image actually sent to the vision model (preprocessed if possible)
+    let visionSucceeded = false;
+    let ocrRawText = null;      // full-label OCR text — always populated once, used for
+                                 // fallback extraction (if vision fails) and/or MGRS cross-check
 
-    // ── Step 1: Vision extraction ──────────────────────────────────────────────
+    // ── Step 1: Vision extraction (on a preprocessed, upscaled + contrast
+    // boosted image where possible) ─────────────────────────────────────────
     setStep('step-vision', 'active');
     try {
-        base64 = await new Promise((res, rej) => {
-            const r = new FileReader();
-            r.onload = () => res(r.result.split(',')[1]);
-            r.onerror = rej;
-            r.readAsDataURL(file);
-        });
-        extracted = await visionExtract(base64, mimeType);
+        base64 = await preprocessForVision(file);
+        if (!base64) {
+            // Preprocessing failed for some reason — fall back to sending the
+            // raw file exactly as before.
+            base64 = await new Promise((res, rej) => {
+                const r = new FileReader();
+                r.onload = () => res(r.result.split(',')[1]);
+                r.onerror = rej;
+                r.readAsDataURL(file);
+            });
+        }
+        extracted = await visionExtract(base64, 'image/jpeg');
+        visionSucceeded = true;
         method = 'qwen3-vl-plus (vision)';
         setStep('step-vision', 'done');
-        setStep('step-ocr', 'done'); // skipped
+        setStep('step-ocr', 'done'); // full OCR-based fallback extraction skipped
     } catch(e) {
         console.warn('Vision extraction failed:', e);
         setStep('step-vision', '');
 
-        // ── Step 2: OCR fallback ───────────────────────────────────────────────
+        // ── Step 2: OCR fallback — preprocessed (grayscale + binarized +
+        // upscaled) image, PSM 6 (uniform block) ───────────────────────────
         setStep('step-ocr', 'active');
         try {
-            const result = await Tesseract.recognize(file, 'eng');
-            extracted = await textExtract(result.data.text);
+            const ocrCanvas = await preprocessForOCR(file);
+            ocrRawText = await runTesseractFullText(ocrCanvas || file);
+            extracted = await textExtract(ocrRawText);
             method = 'tesseract OCR + qwen-plus';
             setStep('step-ocr', 'done');
         } catch(e2) {
@@ -1892,67 +2199,114 @@ async function processFile(file) {
     const rawCandidates = extracted.locality_candidates || [];
     resetGeocodeLog(extracted.locality || null, rawCandidates);
 
-    // ── Step 3/4: Geocode using ALL locality candidates ──────────────────────
-    // geocodeCandidates() runs an anchor-aware, exact-before-fuzzy pass across
-    // every candidate the label offered (most specific AND most general, e.g.
-    // both "Gamia Peaks" and "Mount Kenya"). This prevents a vague or garbled
-    // small-feature name from fuzzy-matching an unrelated, distant place ahead
-    // of a clean match on a well-known landmark.
-    setStep('step-spell', 'active');
     const originalLocality = extracted.locality;
     let coords = null;
-
-    if (rawCandidates.length > 0) {
-        try {
-            coords = await geocodeCandidates(rawCandidates);
-        } catch(e) { console.warn('Candidate geocoding failed:', e); }
-    }
-    setStep('step-spell', 'done');
-
-    // ── Step 4b: Spell-check fallback ────────────────────────────────────────
-    // Only reached if NONE of the raw candidates (exact or fuzzy, anchor-
-    // checked) resolved. As a last resort, ask the LLM for a cautious spelling
-    // correction of the top (most specific) candidate, but only accept it if
-    // the corrected spelling itself independently resolves to a real place.
-    setStep('step-geocode', 'active');
-    if (!coords && originalLocality) {
-        const result = await spellCheckLocality(originalLocality);
-        if (result.corrected !== originalLocality) {
-            extracted.locality = result.corrected;
-            console.log(`Locality corrected: "${originalLocality}" → "${extracted.locality}"`);
-        }
-        coords = result.coords;
-    }
-    if (coords && geocodeLog) {
-        geocodeLog.finalLocalityUsed = coords.matchedTerm || geocodeLog.finalLocalityUsed || extracted.locality;
-        geocodeLog.geocodeSource = coords.source;
-        geocodeLog.matchedTerm = coords.matchedTerm || geocodeLog.matchedTerm;
-        geocodeLog.matchTier = coords.matchTier || geocodeLog.matchTier;
-        geocodeLog.lat = coords.lat;
-        geocodeLog.lon = coords.lon;
-    }
-    setStep('step-geocode', coords ? 'done' : '');
-
-    // ── Step 5: Convert to MGRS ───────────────────────────────────────────────
-    setStep('step-convert', 'active');
     let calcMGRS = null;
-    if (coords) {
-        calcMGRS = MGRS.fromLatLon(coords.lat, coords.lon);
-        if (geocodeLog) geocodeLog.mgrs = calcMGRS.full;
-    }
-    setStep('step-convert', calcMGRS ? 'done' : '');
+    let convertedMGRS = null;
 
-    // Print the full geocode activity trail for this specimen — list of every
-    // name searched, the name that was actually used, any spelling change,
-    // the derived lat/lon, and the MGRS calculated from it.
+    // ── Step 3: Cross-check the MGRS field ──────────────────────────────────
+    // Runs regardless of whether vision or OCR-fallback extraction was used.
+    // If vision already succeeded, this is the FIRST OCR pass for this
+    // specimen (a lightweight, local, no-API-cost scan — not a second full
+    // Tesseract+LLM extraction). If OCR fallback already ran above, its text
+    // is reused here rather than scanning the image twice.
+    setStep('step-crosscheck', 'active');
+    let crossCheck = null;
+    try {
+        if (ocrRawText === null) {
+            const ocrCanvas = await preprocessForOCR(file);
+            ocrRawText = await runTesseractFullText(ocrCanvas || file);
+        }
+        const ocrHasMGRSLikeToken = !!findMGRSInOCRText(ocrRawText);
+        if (extracted.mgrs_coordinates || ocrHasMGRSLikeToken) {
+            crossCheck = await crossValidateMGRS(
+                extracted.mgrs_coordinates,
+                visionSucceeded ? base64 : null,
+                'image/jpeg',
+                ocrRawText
+            );
+            if (crossCheck.resolved && crossCheck.resolved.value &&
+                crossCheck.resolved.value.toUpperCase().replace(/\s+/g,'') !== (extracted.mgrs_coordinates || '').toUpperCase().replace(/\s+/g,'')) {
+                console.log(`MGRS cross-check adopted a different reading: "${extracted.mgrs_coordinates}" → "${crossCheck.resolved.value}" (source: ${crossCheck.resolved.label})`);
+                extracted.mgrs_coordinates = crossCheck.resolved.value;
+            }
+        }
+        setStep('step-crosscheck', 'done');
+    } catch(e) {
+        console.warn('MGRS cross-check pass failed:', e);
+        setStep('step-crosscheck', '');
+    }
+
+    // If the label carried an MGRS value, try to parse/convert it (now with
+    // character-confusion correction as a last-resort fallback — see
+    // MGRS.parseWithCorrection). convertedMGRS stays null if parsing fails
+    // even with correction applied.
+    if (extracted.mgrs_coordinates) {
+        convertedMGRS = MGRS.alToAA(extracted.mgrs_coordinates);
+    }
+
+    if (extracted.mgrs_coordinates && convertedMGRS && convertedMGRS.full) {
+        // ── MGRS present on label AND successfully parsed: convert AL → AA
+        // scheme directly ─────────────────────────────────────────────────
+        ['step-spell', 'step-geocode', 'step-convert'].forEach(s => setStep(s, 'done'));
+        console.log(`MGRS present on label ("${extracted.mgrs_coordinates}") — skipping geocoding, converting AL → AA scheme directly: ${convertedMGRS.full}${convertedMGRS.corrected ? ' (character correction applied: ' + convertedMGRS.correctionsApplied.join(', ') + ')' : ''}`);
+        if (geocodeLog) {
+            geocodeLog.finalLocalityUsed = '(skipped — MGRS present on label, converted AL→AA instead)';
+        }
+    } else {
+        // ── No MGRS on label, OR an MGRS was recorded but couldn't be
+        // parsed even with correction: fall back to locality geocoding ─────
+        if (extracted.mgrs_coordinates && !(convertedMGRS && convertedMGRS.full)) {
+            console.error(`⚠️ Could not parse recorded MGRS "${extracted.mgrs_coordinates}" even with character-confusion correction — falling back to geocoding from locality instead.`);
+        }
+
+        // ── Step 4/5: Geocode using ALL locality candidates ──────────────────
+        setStep('step-spell', 'active');
+        if (rawCandidates.length > 0) {
+            try {
+                coords = await geocodeCandidates(rawCandidates);
+            } catch(e) { console.warn('Candidate geocoding failed:', e); }
+        }
+        setStep('step-spell', 'done');
+
+        // ── Step 5b: Spell-check fallback ────────────────────────────────────
+        setStep('step-geocode', 'active');
+        if (!coords && originalLocality) {
+            const result = await spellCheckLocality(originalLocality);
+            if (result.corrected !== originalLocality) {
+                extracted.locality = result.corrected;
+                console.log(`Locality corrected: "${originalLocality}" → "${extracted.locality}"`);
+            }
+            coords = result.coords;
+        }
+        if (coords && geocodeLog) {
+            geocodeLog.finalLocalityUsed = coords.matchedTerm || geocodeLog.finalLocalityUsed || extracted.locality;
+            geocodeLog.geocodeSource = coords.source;
+            geocodeLog.matchedTerm = coords.matchedTerm || geocodeLog.matchedTerm;
+            geocodeLog.matchTier = coords.matchTier || geocodeLog.matchTier;
+            geocodeLog.lat = coords.lat;
+            geocodeLog.lon = coords.lon;
+        }
+        setStep('step-geocode', coords ? 'done' : '');
+
+        // ── Step 6: Convert to MGRS ───────────────────────────────────────────
+        setStep('step-convert', 'active');
+        if (coords) {
+            calcMGRS = MGRS.fromLatLon(coords.lat, coords.lon);
+            if (geocodeLog) geocodeLog.mgrs = calcMGRS.full;
+        }
+        setStep('step-convert', calcMGRS ? 'done' : '');
+    }
+
+    // Print the full geocode activity trail for this specimen.
     finalizeGeocodeLog();
 
-    // ── Step 5: Validate ──────────────────────────────────────────────────────
+    // ── Step 7: Validate ──────────────────────────────────────────────────────
     setStep('step-validate', 'active');
     setTimeout(() => {
         setStep('step-validate', 'done');
         document.getElementById('progressWrap').style.display = 'none';
-        showResults(extracted, coords, calcMGRS, method, originalLocality);
+        showResults(extracted, coords, calcMGRS, method, originalLocality, convertedMGRS, crossCheck);
     }, 300);
 }
 
@@ -1975,6 +2329,7 @@ document.getElementById('clearBtn').addEventListener('click', () => {
     previewWrap.style.display = 'none';
     fileInput.value = '';
     document.getElementById('resultsAll').classList.remove('visible');
+    document.getElementById('crosscheckWrap').style.display = 'none';
     document.getElementById('emptyState').style.display = 'flex';
     document.getElementById('progressWrap').style.display = 'none';
 });
