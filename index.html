@@ -618,6 +618,14 @@
                         <div class="field-val" id="rDate" contenteditable="true" spellcheck="false">—</div>
                     </div>
                     <div class="field-row">
+                        <div class="field-key">Habitat<br><span style="font-weight:400;color:#b8c4b8;font-size:0.68rem;">(the site)</span></div>
+                        <div class="field-val" id="rHabitat" contenteditable="true" spellcheck="false" style="white-space:pre-wrap;line-height:1.5;">—</div>
+                    </div>
+                    <div class="field-row">
+                        <div class="field-key">Habit<br><span style="font-weight:400;color:#b8c4b8;font-size:0.68rem;">(the plant)</span></div>
+                        <div class="field-val" id="rHabit" contenteditable="true" spellcheck="false" style="white-space:pre-wrap;line-height:1.5;">—</div>
+                    </div>
+                    <div class="field-row">
                         <div class="field-key">Extraction via</div>
                         <div class="field-val" id="rMethod">—</div>
                     </div>
@@ -1268,19 +1276,30 @@ Extract and return ONLY valid JSON with these fields:
   "locality_candidates": ["ordered array of every place name mentioned on the label, MOST SPECIFIC FIRST, MOST GENERAL LAST"],
   "collection_date": "date as written or null",
   "collector": "collector name(s) ONLY — do not include any number, e.g. 'D.A.K. Wamukoya' not 'D.A.K. Wamukoya No. 140' — or null",
-  "field_number": "the collector's specimen/field number, digits (and an optional trailing letter for split sheets, e.g. '140' or '13880a') — or null if none is visible"
+  "field_number": "the collector's specimen/field number, digits (and an optional trailing letter for split sheets, e.g. '140' or '13880a') — or null if none is visible",
+  "habitat": "the site/vegetation description — slope, soil, rockiness, associated species, vegetation type (e.g. label fields like 'Veg. Type', or a free-text habitat sentence) — or null",
+  "habit": "the plant's own growth-form description — tree/shrub/herb, height, bark or stem colour, leaf shape, flower/fruit colour, phenology notes (e.g. label fields like 'Plant Description', or a free-text sentence about the plant itself) — or null"
 }
+
+IMPORTANT RULES FOR species_name / author_citation:
+- The label typically reads the scientific name and its author together, e.g. "Uvaria lucida Benth." — you MUST split these into two separate fields.
+- species_name is ONLY the genus and specific epithet (and infraspecific rank + epithet if present, e.g. "var. kirkii"). NEVER include the author's name/abbreviation in species_name.
+- author_citation is everything that names the author(s) who published the name — abbreviated surnames, initials, "ex", "&", or parenthetical basionym authors (e.g. "Benth.", "R.Br.", "(Vahl) Benth.", "Baker f."). This is NOT part of the species name itself.
+- Example: label text "Uvaria lucida Benth." → species_name: "Uvaria lucida", author_citation: "Benth."
+- Example: label text "Acacia mellifera (Vahl) Benth." → species_name: "Acacia mellifera", author_citation: "(Vahl) Benth."
+- If no author citation is visible, set author_citation to null and do not guess one.
 
 IMPORTANT RULES FOR collector / field_number:
 - These are ALWAYS two separate fields, even when the label prints them right next to each other (e.g. "P. Kuchar 13880" → collector: "P. Kuchar", field_number: "13880").
 - The field number is FREQUENTLY printed as its own separate labeled field elsewhere on the form — look for "No.", "Field No.", "Collector No.", "Specimen No.", or a bare number near (but not necessarily touching) the collector's name or the date. It does NOT have to be physically adjacent to the collector's name to belong to this field — scan the whole label for it.
 - Never merge the number back into the collector field. collector must contain ONLY the person's name.
 - If you cannot find a number anywhere on the label, set field_number to null — do not guess or reuse an unrelated number (e.g. a sheet/barcode number in a corner is NOT the field number unless it's explicitly labeled as the collector's number).
-- species_name is ONLY the genus and specific epithet (and infraspecific rank + epithet if present, e.g. "var. kirkii"). NEVER include the author's name/abbreviation in species_name.
-- author_citation is everything that names the author(s) who published the name — abbreviated surnames, initials, "ex", "&", or parenthetical basionym authors (e.g. "Benth.", "R.Br.", "(Vahl) Benth.", "Baker f."). This is NOT part of the species name itself.
-- Example: label text "Uvaria lucida Benth." → species_name: "Uvaria lucida", author_citation: "Benth."
-- Example: label text "Acacia mellifera (Vahl) Benth." → species_name: "Acacia mellifera", author_citation: "(Vahl) Benth."
-- If no author citation is visible, set author_citation to null and do not guess one.
+
+IMPORTANT RULES FOR habitat / habit:
+- These are two DIFFERENT things and must not be merged: habitat describes the SITE the plant was growing in (terrain, soil, rockiness, other species present, vegetation type); habit describes the PLANT ITSELF (its size, form, bark, leaves, flowers, phenology).
+- Some labels have separate printed fields for these (e.g. "Veg. Type" → habitat, "Plant Description" → habit) — if so, keep them in their respective fields exactly as printed/written.
+- Other labels run them together in one continuous description (e.g. "...rocky slope with open bushland... Tree 4m high, very heavily browsed; flowers yellowish-green."). In that case, split the sentence(s) describing the SITE into habitat, and the sentence(s) describing the PLANT into habit, using your judgement on where the description shifts from site to plant.
+- Transcribe the words as written — do not summarize, reword, or shorten. If only one of the two is present on the label, set the other to null rather than guessing or padding it with inferred content.
 
 IMPORTANT RULES FOR mgrs_coordinates:
 - Read the grid-reference/coordinate text CHARACTER BY CHARACTER, exactly as printed. Do NOT infer, auto-correct, or "clean up" what you see — report exactly what is printed, even if a character looks unusual or the result looks malformed.
@@ -1318,19 +1337,30 @@ async function textExtract(ocrText) {
   "locality_candidates": ["ordered array of every place name found in the text, MOST SPECIFIC FIRST, MOST GENERAL LAST"],
   "collection_date": "date as written or null",
   "collector": "collector name(s) ONLY — do not include any number, e.g. 'D.A.K. Wamukoya' not 'D.A.K. Wamukoya No. 140' — or null",
-  "field_number": "the collector's specimen/field number, digits (and an optional trailing letter for split sheets, e.g. '140' or '13880a') — or null if none is visible"
+  "field_number": "the collector's specimen/field number, digits (and an optional trailing letter for split sheets, e.g. '140' or '13880a') — or null if none is visible",
+  "habitat": "the site/vegetation description — slope, soil, rockiness, associated species, vegetation type (e.g. label fields like 'Veg. Type', or a free-text habitat sentence) — or null",
+  "habit": "the plant's own growth-form description — tree/shrub/herb, height, bark or stem colour, leaf shape, flower/fruit colour, phenology notes (e.g. label fields like 'Plant Description', or a free-text sentence about the plant itself) — or null"
 }
+
+IMPORTANT RULES FOR species_name / author_citation:
+- OCR text typically reads the scientific name and its author together, e.g. "Uvaria lucida Benth." — you MUST split these into two separate fields.
+- species_name is ONLY the genus and specific epithet (and infraspecific rank + epithet if present, e.g. "var. kirkii"). NEVER include the author's name/abbreviation in species_name.
+- author_citation is everything that names the author(s) who published the name — abbreviated surnames, initials, "ex", "&", or parenthetical basionym authors (e.g. "Benth.", "R.Br.", "(Vahl) Benth.", "Baker f."). This is NOT part of the species name itself.
+- Example: text "Uvaria lucida Benth." → species_name: "Uvaria lucida", author_citation: "Benth."
+- Example: text "Acacia mellifera (Vahl) Benth." → species_name: "Acacia mellifera", author_citation: "(Vahl) Benth."
+- If no author citation is present, set author_citation to null and do not guess one.
 
 IMPORTANT RULES FOR collector / field_number:
 - These are ALWAYS two separate fields, even when the text has them right next to each other (e.g. "P. Kuchar 13880" → collector: "P. Kuchar", field_number: "13880").
 - The field number is FREQUENTLY printed as its own separate labeled field elsewhere on the form — look for "No.", "Field No.", "Collector No.", "Specimen No.", or a bare number near (but not necessarily touching) the collector's name or the date. It does NOT have to be directly adjacent to the collector's name — scan the full text for it.
 - Never merge the number back into the collector field. collector must contain ONLY the person's name.
 - If you cannot find a number anywhere in the text, set field_number to null — do not guess or reuse an unrelated number (e.g. a sheet/barcode number is NOT the field number unless it's explicitly labeled as the collector's number).
-- species_name is ONLY the genus and specific epithet (and infraspecific rank + epithet if present, e.g. "var. kirkii"). NEVER include the author's name/abbreviation in species_name.
-- author_citation is everything that names the author(s) who published the name — abbreviated surnames, initials, "ex", "&", or parenthetical basionym authors (e.g. "Benth.", "R.Br.", "(Vahl) Benth.", "Baker f."). This is NOT part of the species name itself.
-- Example: text "Uvaria lucida Benth." → species_name: "Uvaria lucida", author_citation: "Benth."
-- Example: text "Acacia mellifera (Vahl) Benth." → species_name: "Acacia mellifera", author_citation: "(Vahl) Benth."
-- If no author citation is present, set author_citation to null and do not guess one.
+
+IMPORTANT RULES FOR habitat / habit:
+- These are two DIFFERENT things and must not be merged: habitat describes the SITE the plant was growing in (terrain, soil, rockiness, other species present, vegetation type); habit describes the PLANT ITSELF (its size, form, bark, leaves, flowers, phenology).
+- Some labels have separate printed fields for these (e.g. "Veg. Type" → habitat, "Plant Description" → habit) — if so, keep them in their respective fields exactly as printed/written.
+- Other labels run them together in one continuous description (e.g. "...rocky slope with open bushland... Tree 4m high, very heavily browsed; flowers yellowish-green."). In that case, split the sentence(s) describing the SITE into habitat, and the sentence(s) describing the PLANT into habit, using your judgement on where the description shifts from site to plant.
+- Transcribe the words as written — do not summarize, reword, or shorten. If only one of the two is present in the text, set the other to null rather than guessing or padding it with inferred content.
 
 IMPORTANT RULES FOR mgrs_coordinates:
 - Copy the grid-reference/coordinate text CHARACTER BY CHARACTER, exactly as it appears in the OCR text. Do not infer or auto-correct. If no MGRS grid reference is present in the text, return null — do not invent one.
@@ -1530,6 +1560,14 @@ function normalizeExtracted(extracted) {
         extracted.collector = null;
         extracted.field_number = llmFieldNumber || null;
     }
+
+    // Habitat / habit — no code-level splitting needed here (the prompt
+    // handles the site-vs-plant distinction), just trim and normalize to
+    // null so downstream fields don't have to special-case empty strings.
+    extracted.habitat = (typeof extracted.habitat === 'string' && extracted.habitat.trim().length > 0)
+        ? extracted.habitat.trim() : null;
+    extracted.habit = (typeof extracted.habit === 'string' && extracted.habit.trim().length > 0)
+        ? extracted.habit.trim() : null;
 
     return extracted;
 }
@@ -2046,6 +2084,8 @@ function showResults(extracted, coords, calcMGRS, method, originalLocality, conv
     document.getElementById('rCollector').innerText = extracted.collector || '—';
     document.getElementById('rFieldNumber').innerText = extracted.field_number || '—';
     document.getElementById('rDate').innerText      = extracted.collection_date || '—';
+    document.getElementById('rHabitat').innerText   = extracted.habitat || '—';
+    document.getElementById('rHabit').innerText     = extracted.habit || '—';
     document.getElementById('rMethod').innerText    = method;
     document.getElementById('rGeoSource').innerText = coords ? coords.source : '—';
 
@@ -2241,6 +2281,8 @@ function registerSpecimen(thumbSrc, extracted, coords, calcMGRS, convertedMGRS, 
         collector: extracted.collector || '',
         fieldNumber: extracted.field_number || '',
         date: extracted.collection_date || '',
+        habitat: extracted.habitat || '',
+        habit: extracted.habit || '',
         localityRaw: (extracted.locality_candidates || []).join(' / ') || extracted.locality || '',
         localityUsed: coords ? (coords.matchedTerm || extracted.locality || '') : '',
         geoSource: coords ? coords.source
@@ -2300,6 +2342,8 @@ function saveCorrections() {
     record.collector   = readField('rCollector');
     record.fieldNumber = readField('rFieldNumber');
     record.date        = readField('rDate');
+    record.habitat      = readField('rHabitat');
+    record.habit        = readField('rHabit');
     const localityEdited = readField('rLocality');
     record.localityRaw   = localityEdited;
     record.localityUsed  = localityEdited; // manual correction supersedes the geocoder's matched term
@@ -2528,6 +2572,7 @@ function exportBRAHMSCSV() {
         'Determined By', 'Determination Date',
         'Country', 'Gazetteer', 'Locality Notes',
         'Latitude', 'Longitude', 'Map Grid Area', 'Georef Source',
+        'Habitat', 'Habit',
         'Barcode', 'Accession Number', 'Herbarium Code', 'Type Status', 'Duplicates',
         'Extraction Method', 'Notes'
     ];
@@ -2558,6 +2603,7 @@ function exportBRAHMSCSV() {
             r.lat != null ? r.lat.toFixed(6) : '',
             r.lon != null ? r.lon.toFixed(6) : '',
             r.finalMGRS, r.geoSource,
+            r.habitat, r.habit,
             '', '', '', '', '', // Barcode / Accession / Herbarium Code / Type Status / Duplicates — assigned at accessioning
             r.method, r.finalNote
         ];
