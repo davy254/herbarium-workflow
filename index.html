@@ -175,6 +175,9 @@
         }
         .method-vision { background: #e8f4ec; color: #2a6e3e; }
         .method-ocr { background: #fef3e2; color: #8a5a00; }
+        .scheme-badge-al { background: #fef3e2; color: #8a5a00; }
+        .scheme-badge-aa { background: #f2faf5; color: #1e6636; }
+        .scheme-badge-unknown { background: #fdf3f2; color: #922e22; }
 
         /* Progress */
         .progress-wrap {
@@ -510,6 +513,11 @@
     <div class="status-dot" id="statusDot"></div>
     <span class="status-label" id="statusLabel">Backend not tested</span>
     <span class="queue-indicator" id="queueIndicator"></span>
+    <span class="status-label" style="margin-left:auto" title="Specimens dated before this year are treated as legacy AL-scheme MGRS and converted to AA. Specimens dated this year or later are assumed already AA and left unconverted. Adjust if your region's cutoff differs.">
+        AL→AA cutoff year:
+        <input type="number" id="schemeCutoffYear" value="2001" min="1900" max="2099"
+            style="width:64px;font-family:'IBM Plex Mono',monospace;font-size:0.8125rem;border:1px solid #c5ccc5;border-radius:4px;padding:2px 6px;background:#fff;color:#1a1f1a;">
+    </span>
     <button class="btn-test" id="testBtn">Test connection</button>
 </div>
 
@@ -592,6 +600,18 @@
                     <div class="field-row">
                         <div class="field-key">Recorded MGRS</div>
                         <div class="field-val" id="rMGRS">—</div>
+                    </div>
+                    <div class="field-row" id="schemeOverrideWrap" style="display:none;">
+                        <div class="field-key">Grid Scheme</div>
+                        <div class="field-val" style="font-family:'Inter',sans-serif;">
+                            <span id="schemeOverrideBadge" style="font-family:'IBM Plex Mono',monospace;font-size:0.75rem;padding:2px 8px;border-radius:3px;margin-right:8px;"></span>
+                            <select id="schemeOverrideSelect" style="font-size:0.8125rem;font-family:'Inter',sans-serif;border:1px solid #c5ccc5;border-radius:4px;padding:3px 6px;">
+                                <option value="auto">Auto (by date)</option>
+                                <option value="AL">Legacy AL → convert to AA</option>
+                                <option value="AA">Current AA → no conversion</option>
+                            </select>
+                            <button class="row-btn" id="applySchemeBtn" style="margin-left:6px;">Apply</button>
+                        </div>
                     </div>
                     <div class="field-row">
                         <div class="field-key">Locality</div>
@@ -1138,6 +1158,52 @@ const MGRS = {
         const rowLetterAA = this.ROW_ALPHABET_20[(rowIdx + 10) % 20];
         const newSquare = colLetter + rowLetterAA;
         const full = `${prefix.zone}${prefix.band} ${newSquare} ${nums.easting} ${nums.northing}`;
+        return { full, corrected, correctionsApplied };
+    },
+
+    // ── Date-based AL vs AA scheme detection ────────────────────────────────
+    // Extracts a plausible 4-digit collection year from a free-text date
+    // string in any of the formats these labels use ("11 Jan 1981", "March
+    // 1980", "23 May 1979", a bare "1980", etc). Returns null if no year in
+    // the range 1800–2099 is found.
+    parseYear(dateStr) {
+        if (!dateStr) return null;
+        const m = String(dateStr).match(/\b(1[89]\d{2}|20\d{2})\b/);
+        return m ? parseInt(m[0], 10) : null;
+    },
+
+    // Decides which 100km-square lettering scheme a recorded MGRS value is
+    // most likely expressed in, based on the specimen's collection date and
+    // a cutoff year. This exists specifically to prevent a serious class of
+    // error: blindly running alToAA() on every recorded MGRS regardless of
+    // date "converts" specimens that are ALREADY in the current AA scheme,
+    // shifting their row letter by 10 and silently corrupting an otherwise-
+    // correct grid reference into a wrong 100km square, potentially hundreds
+    // of kilometres from the true location.
+    //   - year <  cutoffYear → 'AL' (legacy scheme — needs conversion)
+    //   - year >= cutoffYear → 'AA' (current scheme — must NOT be converted)
+    //   - year unknown       → 'unknown' — the safe default is to leave the
+    //     recorded value AS-IS (no shift). An incorrect shift actively
+    //     damages correct data, whereas leaving genuinely-old AL data
+    //     unconverted just means it stays flagged for manual review instead
+    //     of being silently wrong.
+    determineScheme(dateStr, cutoffYear) {
+        const year = this.parseYear(dateStr);
+        if (year === null) return { scheme: 'unknown', year: null, cutoffYear };
+        return { scheme: year < cutoffYear ? 'AL' : 'AA', year, cutoffYear };
+    },
+
+    // Parses/character-corrects a recorded MGRS string WITHOUT applying the
+    // AL→AA row-letter shift — used when the date indicates the grid
+    // reference is already in the current AA scheme, or the scheme is
+    // unknown and the safer default ("trust as printed") applies. Returns
+    // the same { full, corrected, correctionsApplied } shape as alToAA() so
+    // callers can treat both branches identically.
+    normalizeAA(mgrsStr) {
+        const parsed = this.parseWithCorrection(mgrsStr);
+        if (!parsed) return null;
+        const { prefix, nums, corrected, correctionsApplied } = parsed;
+        const full = `${prefix.zone}${prefix.band} ${prefix.square} ${nums.easting} ${nums.northing}`;
         return { full, corrected, correctionsApplied };
     }
 };
@@ -2068,7 +2134,7 @@ function renderCrossCheckCard(crossCheck) {
     </div>`;
 }
 
-function showResults(extracted, coords, calcMGRS, method, originalLocality, convertedMGRS, crossCheck) {
+function showResults(extracted, coords, calcMGRS, method, originalLocality, convertedMGRS, crossCheck, schemeInfo) {
     document.getElementById('emptyState').style.display = 'none';
     document.getElementById('resultsAll').classList.add('visible');
 
@@ -2102,35 +2168,59 @@ function showResults(extracted, coords, calcMGRS, method, originalLocality, conv
             : '';
 
         const vCard = document.getElementById('validationCard');
-        if (convertedMGRS.full === extracted.mgrs_coordinates.toUpperCase().replace(/\s+/g, ' ').trim()) {
-            vCard.innerHTML = `<div class="validation-card pass">
-                <div class="validation-title">Already in AA scheme</div>
-                <div class="validation-body">
-                    The recorded MGRS <strong>${extracted.mgrs_coordinates}</strong> maps to itself under the
-                    AL → AA row-letter shift, so it was already expressed in the current AA scheme.
-                    Geocoding was skipped since coordinates were already present on the label.${correctionNote}
-                </div>
-            </div>`;
-        } else {
+        const scheme = schemeInfo ? schemeInfo.scheme : 'unknown';
+        const year = schemeInfo ? schemeInfo.year : null;
+        const cutoffYear = schemeInfo ? schemeInfo.cutoffYear : '?';
+
+        if (scheme === 'AL') {
             vCard.innerHTML = `<div class="validation-card info">
                 <div class="validation-title">Converted from AL to AA scheme</div>
                 <div class="validation-body">
-                    Recorded MGRS <strong>${extracted.mgrs_coordinates}</strong> was treated as the legacy AL
-                    100&nbsp;km-square lettering scheme and converted directly to the current AA scheme
+                    Collection year <strong>${year}</strong> is before the cutoff (<strong>${cutoffYear}</strong>), so
+                    recorded MGRS <strong>${extracted.mgrs_coordinates}</strong> was treated as the legacy AL
+                    100&nbsp;km-square lettering scheme and converted to the current AA scheme
                     (<strong>${convertedMGRS.full}</strong>) — the row letter was shifted 10 places; the column
                     letter and numeric easting/northing digits were left unchanged.
                     Geocoding was skipped since coordinates were already present on the label.${correctionNote}
                 </div>
             </div>`;
+        } else if (scheme === 'AA') {
+            vCard.innerHTML = `<div class="validation-card pass">
+                <div class="validation-title">Already in AA scheme — no conversion applied</div>
+                <div class="validation-body">
+                    Collection year <strong>${year}</strong> is on/after the cutoff (<strong>${cutoffYear}</strong>), so
+                    recorded MGRS <strong>${extracted.mgrs_coordinates}</strong> was treated as already being in the
+                    current AA scheme and used as recorded — no row-letter shift was applied.
+                    Geocoding was skipped since coordinates were already present on the label.${correctionNote}
+                </div>
+            </div>`;
+        } else {
+            vCard.innerHTML = `<div class="validation-card fail">
+                <div class="validation-title">⚠ Collection date unknown — grid scheme not verified</div>
+                <div class="validation-body">
+                    Could not determine a collection year from "<strong>${extracted.collection_date || '(no date)'}</strong>",
+                    so it isn't possible to confirm whether recorded MGRS <strong>${extracted.mgrs_coordinates}</strong>
+                    uses the legacy AL or current AA lettering scheme. To avoid corrupting data that may already be
+                    correct, <strong>no row-letter shift was applied</strong> — the value below is used as recorded
+                    (only character-confusion correction applied, if needed).
+                    If you know this specimen predates ~${cutoffYear}, use the Grid Scheme override below to force
+                    an AL→AA conversion.${correctionNote}
+                </div>
+            </div>`;
         }
 
         document.getElementById('finalMGRS').innerText = convertedMGRS.full;
-        document.getElementById('finalNote').innerText  = convertedMGRS.corrected
-            ? 'AL → AA scheme conversion (character-confusion correction applied, no geocoding performed)'
-            : 'AL → AA scheme conversion (no geocoding performed)';
+        document.getElementById('finalNote').innerText  =
+            scheme === 'AL' ? `AL → AA conversion (dated ${year}, before cutoff ${cutoffYear})`
+          : scheme === 'AA' ? `no conversion — already AA (dated ${year}, on/after cutoff ${cutoffYear})`
+          : `no conversion — date unknown, scheme unverified (used as recorded)`;
         document.getElementById('methodBadge').innerText = method;
+
+        renderSchemeOverride(scheme, extracted.mgrs_coordinates);
         return;
     }
+
+    document.getElementById('schemeOverrideWrap') && (document.getElementById('schemeOverrideWrap').style.display = 'none');
 
     const localityUsedEl = document.getElementById('rLocalityUsed');
     if (coords) {
@@ -2366,6 +2456,7 @@ function wireSaveCorrectionsButton() {
     const btn = document.getElementById('saveCorrectionsBtn');
     if (btn) btn.onclick = saveCorrections;
     wireRegeocodeButton();
+    wireSchemeOverrideButton();
 }
 
 // ── Manual re-geocode ────────────────────────────────────────────────────────
@@ -2461,6 +2552,107 @@ async function regeocodeFromLocality() {
 function wireRegeocodeButton() {
     const btn = document.getElementById('regeocodeBtn');
     if (btn) btn.onclick = regeocodeFromLocality;
+}
+
+// ── Grid Scheme override ─────────────────────────────────────────────────────
+// Shows the auto-detected AL/AA scheme (from MGRS.determineScheme, based on
+// collection date + the cutoff year input) as a small badge, and lets the
+// person force a different interpretation per specimen — needed because
+// (a) many older labels have no parseable date at all, and (b) date parsing
+// can occasionally misfire on unusual formats. This is a manual safety valve
+// on top of the date-based default, not a replacement for it.
+function renderSchemeOverride(scheme, mgrsRaw) {
+    const wrap = document.getElementById('schemeOverrideWrap');
+    const badge = document.getElementById('schemeOverrideBadge');
+    const select = document.getElementById('schemeOverrideSelect');
+    if (!wrap || !badge || !select) return;
+
+    wrap.style.display = 'grid';
+    wrap.dataset.rawMgrs = mgrsRaw || '';
+
+    const labels = {
+        AL: ['scheme-badge-al', 'AL (legacy) — converted'],
+        AA: ['scheme-badge-aa', 'AA (current) — as recorded'],
+        unknown: ['scheme-badge-unknown', 'unverified — as recorded']
+    };
+    const [cls, text] = labels[scheme] || labels.unknown;
+    badge.className = '';
+    badge.classList.add(cls);
+    badge.textContent = text;
+
+    // Reflect the auto-detected scheme in the dropdown as "auto" by default
+    // rather than pre-selecting AL/AA, so it's clear this came from the date
+    // and hasn't been manually forced yet.
+    select.value = 'auto';
+}
+
+async function applySchemeOverride() {
+    if (!currentSpecimenId) return;
+    const record = allSpecimens.find(s => s.id === currentSpecimenId);
+    if (!record) return;
+
+    const wrap = document.getElementById('schemeOverrideWrap');
+    const select = document.getElementById('schemeOverrideSelect');
+    const rawMgrs = wrap ? wrap.dataset.rawMgrs : (record.recordedMGRS || '');
+    if (!rawMgrs) return;
+
+    const choice = select.value; // 'auto' | 'AL' | 'AA'
+    const cutoffYear = parseInt(document.getElementById('schemeCutoffYear').value, 10) || 2001;
+
+    let convertedMGRS, scheme, year;
+    if (choice === 'auto') {
+        const detected = MGRS.determineScheme(record.date, cutoffYear);
+        scheme = detected.scheme;
+        year = detected.year;
+        convertedMGRS = scheme === 'AL' ? MGRS.alToAA(rawMgrs) : MGRS.normalizeAA(rawMgrs);
+    } else if (choice === 'AL') {
+        scheme = 'AL';
+        year = MGRS.parseYear(record.date);
+        convertedMGRS = MGRS.alToAA(rawMgrs);
+    } else {
+        scheme = 'AA';
+        year = MGRS.parseYear(record.date);
+        convertedMGRS = MGRS.normalizeAA(rawMgrs);
+    }
+
+    if (!convertedMGRS || !convertedMGRS.full) {
+        alert(`Could not parse recorded MGRS "${rawMgrs}" — cannot apply scheme override.`);
+        return;
+    }
+
+    document.getElementById('finalMGRS').innerText = convertedMGRS.full;
+    document.getElementById('finalNote').innerText =
+        choice === 'auto'
+            ? `re-evaluated automatically (${scheme}${year ? ', dated ' + year : ', date unknown'})`
+            : `manually forced to ${scheme} scheme by user override`;
+
+    const vCard = document.getElementById('validationCard');
+    vCard.innerHTML = `<div class="validation-card info">
+        <div class="validation-title">Grid scheme manually ${choice === 'auto' ? 're-evaluated' : 'overridden'}</div>
+        <div class="validation-body">
+            Recorded MGRS <strong>${rawMgrs}</strong> was ${scheme === 'AL' ? 're-interpreted as legacy AL scheme and converted' : 'treated as current AA scheme (no row-letter shift)'}
+            to produce <strong>${convertedMGRS.full}</strong>, based on a ${choice === 'auto' ? 'date re-check' : 'manual override'}.
+        </div>
+    </div>`;
+
+    renderSchemeOverride(scheme, rawMgrs);
+
+    // Persist to the record.
+    record.finalMGRS = convertedMGRS.full;
+    record.finalNote = document.getElementById('finalNote').innerText;
+    record.snapshotHTML = document.getElementById('resultsAll').innerHTML;
+    renderSpecimenTable();
+
+    const status = document.getElementById('saveStatus');
+    if (status) {
+        status.classList.add('show');
+        setTimeout(() => status.classList.remove('show'), 1800);
+    }
+}
+
+function wireSchemeOverrideButton() {
+    const btn = document.getElementById('applySchemeBtn');
+    if (btn) btn.onclick = applySchemeOverride;
 }
 
 function removeSpecimen(id) {
@@ -2694,6 +2886,7 @@ async function processFile(file, thumbSrc) {
     let coords = null;
     let calcMGRS = null;
     let convertedMGRS = null;
+    let schemeInfo = null; // { scheme: 'AL'|'AA'|'unknown', year, cutoffYear } — see MGRS.determineScheme
 
     // ── Step 3: Cross-check the MGRS field ──────────────────────────────────
     setStep('step-crosscheck', 'active');
@@ -2724,14 +2917,29 @@ async function processFile(file, thumbSrc) {
     }
 
     if (extracted.mgrs_coordinates) {
-        convertedMGRS = MGRS.alToAA(extracted.mgrs_coordinates);
+        const cutoffYear = parseInt(document.getElementById('schemeCutoffYear').value, 10) || 2001;
+        schemeInfo = MGRS.determineScheme(extracted.collection_date, cutoffYear);
+
+        if (schemeInfo.scheme === 'AL') {
+            convertedMGRS = MGRS.alToAA(extracted.mgrs_coordinates);
+            console.log(`Collection year ${schemeInfo.year} is before the AL→AA cutoff (${cutoffYear}) — treating "${extracted.mgrs_coordinates}" as legacy AL scheme and converting.`);
+        } else if (schemeInfo.scheme === 'AA') {
+            convertedMGRS = MGRS.normalizeAA(extracted.mgrs_coordinates);
+            console.log(`Collection year ${schemeInfo.year} is on/after the AL→AA cutoff (${cutoffYear}) — treating "${extracted.mgrs_coordinates}" as already AA scheme, no row-letter shift applied.`);
+        } else {
+            // Unknown date: the safe default is NOT to shift the row letter.
+            // Blindly assuming AL here (the old, buggy behavior) risks
+            // silently corrupting a specimen that is actually already AA.
+            convertedMGRS = MGRS.normalizeAA(extracted.mgrs_coordinates);
+            console.warn(`Could not determine a collection year from "${extracted.collection_date}" — cannot confirm AL vs AA scheme. Using recorded MGRS as-is (no conversion applied). Use the Grid Scheme override in the results panel if you know this specimen predates ~${cutoffYear}.`);
+        }
     }
 
     if (extracted.mgrs_coordinates && convertedMGRS && convertedMGRS.full) {
         ['step-spell', 'step-geocode', 'step-convert'].forEach(s => setStep(s, 'done'));
-        console.log(`MGRS present on label ("${extracted.mgrs_coordinates}") — skipping geocoding, converting AL → AA scheme directly: ${convertedMGRS.full}${convertedMGRS.corrected ? ' (character correction applied: ' + convertedMGRS.correctionsApplied.join(', ') + ')' : ''}`);
+        console.log(`MGRS present on label ("${extracted.mgrs_coordinates}") — skipping geocoding. Grid scheme: ${schemeInfo.scheme}. Result: ${convertedMGRS.full}${convertedMGRS.corrected ? ' (character correction applied: ' + convertedMGRS.correctionsApplied.join(', ') + ')' : ''}`);
         if (geocodeLog) {
-            geocodeLog.finalLocalityUsed = '(skipped — MGRS present on label, converted AL→AA instead)';
+            geocodeLog.finalLocalityUsed = '(skipped — MGRS present on label, scheme handled directly)';
         }
     } else {
         if (extracted.mgrs_coordinates && !(convertedMGRS && convertedMGRS.full)) {
@@ -2780,7 +2988,7 @@ async function processFile(file, thumbSrc) {
     await new Promise(resolve => setTimeout(resolve, 300));
     setStep('step-validate', 'done');
     document.getElementById('progressWrap').style.display = 'none';
-    showResults(extracted, coords, calcMGRS, method, originalLocality, convertedMGRS, crossCheck);
+    showResults(extracted, coords, calcMGRS, method, originalLocality, convertedMGRS, crossCheck, schemeInfo);
 
     // NEW: archive this specimen into the batch registry / table below.
     registerSpecimen(thumbSrc, extracted, coords, calcMGRS, convertedMGRS, method);
