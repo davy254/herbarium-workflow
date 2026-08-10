@@ -6,6 +6,7 @@
     <title>Plant Specimen MGRS Validator — Batch / BRAHMS Export</title>
     <script src="https://cdn.tailwindcss.com"></script>
     <script src="https://cdn.jsdelivr.net/npm/tesseract.js@4/dist/tesseract.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
     <style>
         @import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=Inter:wght@400;500;600&display=swap');
 
@@ -634,6 +635,10 @@
                         <div class="field-val" id="rFieldNumber" contenteditable="true" spellcheck="false">—</div>
                     </div>
                     <div class="field-row">
+                        <div class="field-key">Image Filename<br><span style="font-weight:400;color:#b8c4b8;font-size:0.68rem;">(links photo↔row)</span></div>
+                        <div class="field-val" id="rImageFilename" contenteditable="true" spellcheck="false">—</div>
+                    </div>
+                    <div class="field-row">
                         <div class="field-key">Date</div>
                         <div class="field-val" id="rDate" contenteditable="true" spellcheck="false">—</div>
                     </div>
@@ -704,8 +709,13 @@
         <div class="panel-label" style="margin-bottom:0;">Processed specimens (<span id="specimenCount">0</span>)</div>
         <div class="batch-actions">
             <button class="btn-outline" id="clearAllBtn">Clear all</button>
+            <button class="btn-outline" id="exportZipBtn">Download photos (ZIP)</button>
             <button class="btn-primary" id="exportCsvBtn">Export BRAHMS CSV</button>
         </div>
+    </div>
+    <div style="font-size:0.75rem;color:#8a9a8a;margin:-0.5rem 0 1rem;font-family:'Inter',sans-serif;">
+        Each photo is named to match its "Image Filename" column in the CSV, so BRAHMS's image importer can link
+        them together. Edit a specimen's Image Filename in its panel (e.g. to match a barcode once assigned) before exporting.
     </div>
     <div id="batchTableWrap">
         <div class="batch-empty" id="batchEmpty">No specimens processed yet — results will appear here as each upload finishes.</div>
@@ -2362,9 +2372,17 @@ let currentSpecimenId = null; // which specimen's data is currently shown in the
 
 function registerSpecimen(thumbSrc, extracted, coords, calcMGRS, convertedMGRS, method) {
     const id = 'sp_' + (++specimenCounter);
+
+    const ext = extensionFromDataUrl(thumbSrc);
+    const defaultBase = generateDefaultImageFilename(extracted, id);
+    const imageFilename = `${defaultBase}.${ext}`;
+    const fnEl = document.getElementById('rImageFilename');
+    if (fnEl) fnEl.innerText = imageFilename;
+
     const record = {
         id,
         thumb: thumbSrc,
+        imageFilename,
         species: extracted.species_name || '',
         author: extracted.author_citation || '',
         family: '', // not currently extracted by the vision/OCR prompts — left blank for manual fill in BRAHMS
@@ -2385,8 +2403,10 @@ function registerSpecimen(thumbSrc, extracted, coords, calcMGRS, convertedMGRS, 
         finalNote: document.getElementById('finalNote').innerText,
         method: method,
         // Full snapshot of the rendered results panel, so "View" can restore
-        // exactly what was shown (validation card, cross-check card, colors,
-        // etc.) without re-running any extraction or geocoding.
+        // exactly what was shown (validation card, cross-check card, image
+        // filename, colors, etc.) without re-running any extraction or
+        // geocoding. Captured AFTER imageFilename is written into the DOM
+        // above, so the snapshot reflects it.
         snapshotHTML: document.getElementById('resultsAll').innerHTML,
         snapshotBadge: document.getElementById('methodBadge').innerText
     };
@@ -2434,6 +2454,19 @@ function saveCorrections() {
     record.date        = readField('rDate');
     record.habitat      = readField('rHabitat');
     record.habit        = readField('rHabit');
+
+    // Image filename: keep it non-empty and always carrying the correct
+    // extension for the actual photo, even if the person deletes or
+    // mistypes the extension while editing the base name.
+    const correctExt = extensionFromDataUrl(record.thumb);
+    let editedFilename = readField('rImageFilename');
+    if (!editedFilename || editedFilename === '—') {
+        editedFilename = record.imageFilename; // fall back to whatever it already was
+    } else if (!new RegExp(`\\.${correctExt}$`, 'i').test(editedFilename)) {
+        editedFilename = sanitizeFilenameSegment(editedFilename.replace(/\.[a-zA-Z0-9]+$/, '')) + '.' + correctExt;
+    }
+    record.imageFilename = editedFilename;
+    document.getElementById('rImageFilename').innerText = editedFilename;
     const localityEdited = readField('rLocality');
     record.localityRaw   = localityEdited;
     record.localityUsed  = localityEdited; // manual correction supersedes the geocoder's matched term
@@ -2666,6 +2699,61 @@ function escapeHtml(s) {
     }[c]));
 }
 
+// ── Image filename / linking key ─────────────────────────────────────────────
+// BRAHMS does not store photos inside its data table at all — its image
+// module works by matching separate image FILES to specimen records via a
+// filename or link key, then computing its own "File Found" / "Is Linked"
+// status once a match is confirmed on import. So the fix here isn't putting
+// an image into a CSV cell (not how BRAHMS or any relational database
+// works) — it's giving every specimen a stable, human-editable filename
+// that (a) is written into its own CSV column so BRAHMS's importer has
+// something to match against, and (b) is exactly what the corresponding
+// photo is named when exported as a real file (see exportPhotosZip below).
+//
+// Barcode/Accession Number aren't available yet at this stage (assigned
+// during accessioning, not on the original label), so they can't be used
+// as the link key. Field Number + collector/species is the most stable,
+// human-recognisable identifier actually present at digitization time.
+// This is only a DEFAULT — it's editable per specimen, so it can be
+// renamed to match the eventual barcode once one is assigned.
+function sanitizeFilenameSegment(s) {
+    return String(s || '')
+        .trim()
+        .replace(/[^\w\s-]/g, '')   // strip anything not alphanumeric/underscore/hyphen/space
+        .replace(/\s+/g, '_')
+        .replace(/_+/g, '_')
+        .replace(/^_+|_+$/g, '');
+}
+
+function generateDefaultImageFilename(extracted, specimenId) {
+    const speciesPart = sanitizeFilenameSegment(extracted.species_name);
+    const fieldNumPart = sanitizeFilenameSegment(extracted.field_number);
+    const parts = [speciesPart, fieldNumPart].filter(Boolean);
+    const base = parts.length > 0 ? parts.join('_') : `specimen_${specimenId}`;
+    return base;
+}
+
+// Extracts the file extension implied by a data: URL's MIME type (the thumb
+// stored per specimen is always a data URL — see handleFile's FileReader).
+function extensionFromDataUrl(dataUrl) {
+    const m = /^data:image\/([a-zA-Z0-9.+-]+);base64,/.exec(dataUrl || '');
+    if (!m) return 'jpg';
+    const mime = m[1].toLowerCase();
+    if (mime === 'jpeg') return 'jpg';
+    if (mime === 'svg+xml') return 'svg';
+    return mime;
+}
+
+function dataUrlToBlob(dataUrl) {
+    const [header, base64] = dataUrl.split(',');
+    const mimeMatch = /^data:(.*?);base64$/.exec(header);
+    const mime = mimeMatch ? mimeMatch[1] : 'image/jpeg';
+    const binary = atob(base64);
+    const bytes = new Uint8Array(binary.length);
+    for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+    return new Blob([bytes], { type: mime });
+}
+
 // ── BRAHMS Collector / Field Number split ───────────────────────────────────
 // Herbarium labels almost always record the collector as "Name Number"
 // (e.g. "P. Kuchar 13880"), but BRAHMS keeps these as separate fields
@@ -2715,7 +2803,10 @@ function renderSpecimenTable() {
         const fieldNumber = r.fieldNumber || fallback.fieldNumber || '';
         return `
         <tr>
-            <td><img class="sp-thumb" src="${r.thumb}" alt=""></td>
+            <td>
+                <img class="sp-thumb" src="${r.thumb}" alt="">
+                <div style="font-size:0.62rem;color:#8a9a8a;font-family:'IBM Plex Mono',monospace;max-width:60px;overflow-wrap:break-word;margin-top:3px;">${escapeHtml(r.imageFilename)}</div>
+            </td>
             <td>
                 <span class="sp-species">${escapeHtml(r.species) || '<span class="sp-empty-cell">not found</span>'}</span>
                 ${r.author ? `<br><span style="font-size:0.72rem;color:#8a9a8a">${escapeHtml(r.author)}</span>` : ''}
@@ -2755,6 +2846,63 @@ function renderSpecimenTable() {
 //     field, so filling them here would mean fabricating identifiers.
 // Rename any header below to match your exact BRAHMS import template if it
 // differs — row content stays the same either way.
+// ─── Photo export (ZIP) ─────────────────────────────────────────────────────
+// BRAHMS keeps photos as separate files, not as data embedded in the
+// specimen table — its image module links a file to a record by matching
+// filenames/link keys during a separate image-import step. This bundles
+// every specimen's photo (already held in memory as a data URL from the
+// original upload) into a single ZIP, each one named exactly as shown in
+// its "Image Filename" field/column, so the CSV and the photos line up
+// directly for that import.
+async function exportPhotosZip() {
+    if (allSpecimens.length === 0) return;
+    if (typeof JSZip === 'undefined') {
+        alert('ZIP library failed to load (JSZip). Check your network connection and try again.');
+        return;
+    }
+
+    const btn = document.getElementById('exportZipBtn');
+    const originalLabel = btn.textContent;
+    btn.disabled = true;
+    btn.textContent = 'Zipping…';
+
+    try {
+        const zip = new JSZip();
+        const usedNames = new Set();
+
+        allSpecimens.forEach(r => {
+            let filename = r.imageFilename || `specimen_${r.id}.${extensionFromDataUrl(r.thumb)}`;
+            // Guard against two specimens ending up with the same filename
+            // (e.g. identical species + field number edited by hand) —
+            // silently overwriting one photo with another in the ZIP would
+            // be a worse outcome than a slightly ugly de-duplicated name.
+            if (usedNames.has(filename.toLowerCase())) {
+                const dot = filename.lastIndexOf('.');
+                const base = dot > -1 ? filename.slice(0, dot) : filename;
+                const ext = dot > -1 ? filename.slice(dot) : '';
+                let n = 2;
+                let candidate = `${base}_${n}${ext}`;
+                while (usedNames.has(candidate.toLowerCase())) { n++; candidate = `${base}_${n}${ext}`; }
+                filename = candidate;
+            }
+            usedNames.add(filename.toLowerCase());
+            zip.file(filename, dataUrlToBlob(r.thumb));
+        });
+
+        const blob = await zip.generateAsync({ type: 'blob' });
+        const a = document.createElement('a');
+        a.href = URL.createObjectURL(blob);
+        a.download = 'herbarium_specimen_photos.zip';
+        a.click();
+    } catch (e) {
+        console.error('Photo ZIP export failed:', e);
+        alert('Could not build the photo ZIP: ' + e.message);
+    } finally {
+        btn.disabled = false;
+        btn.textContent = originalLabel;
+    }
+}
+
 function exportBRAHMSCSV() {
     if (allSpecimens.length === 0) return;
 
@@ -2765,6 +2913,7 @@ function exportBRAHMSCSV() {
         'Country', 'Gazetteer', 'Locality Notes',
         'Latitude', 'Longitude', 'Map Grid Area', 'Georef Source',
         'Habitat', 'Habit',
+        'Image Filename',
         'Barcode', 'Accession Number', 'Herbarium Code', 'Type Status', 'Duplicates',
         'Extraction Method', 'Notes'
     ];
@@ -2796,6 +2945,7 @@ function exportBRAHMSCSV() {
             r.lon != null ? r.lon.toFixed(6) : '',
             r.finalMGRS, r.geoSource,
             r.habitat, r.habit,
+            r.imageFilename,
             '', '', '', '', '', // Barcode / Accession / Herbarium Code / Type Status / Duplicates — assigned at accessioning
             r.method, r.finalNote
         ];
@@ -2813,6 +2963,7 @@ function exportBRAHMSCSV() {
 }
 
 document.getElementById('exportCsvBtn').addEventListener('click', exportBRAHMSCSV);
+document.getElementById('exportZipBtn').addEventListener('click', exportPhotosZip);
 document.getElementById('clearAllBtn').addEventListener('click', () => {
     allSpecimens = [];
     renderSpecimenTable();
