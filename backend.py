@@ -9,7 +9,7 @@ CORS(app, origins=[
     "https://davy254.github.io"   # for live frontend
 ])
 
-API_KEY = "sk-mr-3c4d1d7c7bc043b6dcab8d40f8e523263fca0fb515611275370141962985fb3a"
+API_KEY = "sk-mr-ef491305ef0308717e6249b95666e2c57865e85c07f21a4534c32fa3ee7b9ebf"
 API_URL = "https://api.mulerouter.ai/vendors/openai/v1/chat/completions"
 
 @app.route('/api/chat', methods=['POST'])
