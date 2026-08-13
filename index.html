@@ -7,6 +7,8 @@
     <script src="https://cdn.tailwindcss.com"></script>
     <script src="https://cdn.jsdelivr.net/npm/tesseract.js@4/dist/tesseract.min.js"></script>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js"></script>
+    <script src="https://unpkg.com/mgrs@2.0.0/dist/mgrs.js"></script>
     <style>
         @import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=Inter:wght@400;500;600&display=swap');
 
@@ -710,11 +712,11 @@
         <div class="batch-actions">
             <button class="btn-outline" id="clearAllBtn">Clear all</button>
             <button class="btn-outline" id="exportZipBtn">Download photos (ZIP)</button>
-            <button class="btn-primary" id="exportCsvBtn">Export BRAHMS CSV</button>
+            <button class="btn-primary" id="exportXlsxBtn">Export BRAHMS Workbook (.xlsx)</button>
         </div>
     </div>
     <div style="font-size:0.75rem;color:#8a9a8a;margin:-0.5rem 0 1rem;font-family:'Inter',sans-serif;">
-        Each photo is named to match its "Image Filename" column in the CSV, so BRAHMS's image importer can link
+        Each photo is named to match its "Image Filename" column in the workbook, so BRAHMS's image importer can link
         them together. Edit a specimen's Image Filename in its panel (e.g. to match a barcode once assigned) before exporting.
     </div>
     <div id="batchTableWrap">
@@ -1215,6 +1217,38 @@ const MGRS = {
         const { prefix, nums, corrected, correctionsApplied } = parsed;
         const full = `${prefix.zone}${prefix.band} ${prefix.square} ${nums.easting} ${nums.northing}`;
         return { full, corrected, correctionsApplied };
+    },
+
+    // ── MGRS → lat/lon (inverse conversion) ─────────────────────────────────
+    // Needed whenever a specimen already has an MGRS grid reference recorded
+    // on the label — geocoding is skipped in that case (the coordinate is
+    // already known), but the pipeline still needs decimal lat/lon for
+    // display and for the exported workbook. The inverse of fromLatLon()
+    // above is considerably more involved than the forward direction: it
+    // requires an inverse Transverse Mercator (footpoint-latitude) solution
+    // AND resolving which 2,000km northing band a given row letter actually
+    // falls in (row letters repeat every 2,000km, so the latitude band has
+    // to be used to disambiguate). Rather than hand-roll that under time
+    // pressure — where a subtle mistake could silently produce a wrong
+    // location for a real specimen — this wraps the well-established `mgrs`
+    // library (proj4js/mgrs, loaded via CDN above), which handles both
+    // correctly. This does not touch or depend on fromLatLon() at all.
+    toLatLon(mgrsStr) {
+        if (typeof mgrs === 'undefined') {
+            console.warn('mgrs library not loaded — cannot derive lat/lon from MGRS string.');
+            return null;
+        }
+        const parsed = this.parseWithCorrection(mgrsStr);
+        if (!parsed) return null;
+        const clean = `${parsed.prefix.zone}${parsed.prefix.band}${parsed.prefix.square}${parsed.nums.easting}${parsed.nums.northing}`;
+        try {
+            const point = mgrs.toPoint(clean); // returns [lon, lat]
+            if (!point || point.length < 2 || !isFinite(point[0]) || !isFinite(point[1])) return null;
+            return { lat: point[1], lon: point[0] };
+        } catch (e) {
+            console.warn(`mgrs.toPoint failed for "${clean}":`, e);
+            return null;
+        }
     }
 };
 </script>
@@ -1568,6 +1602,76 @@ function isDescriptiveFragment(candidate) {
     return descriptiveCount >= 2;
 }
 
+// ── Collection date parsing / DD-MM-YYYY normalization ──────────────────────
+// Herbarium labels record dates in all sorts of free-text formats — "11 Jan
+// 1981", "23 May 1979", "March 1980" (day often just isn't recorded), a bare
+// "1980", or numeric "12/03/1981". This extracts whatever day/month/year
+// components are actually present (never fabricating a missing one) and
+// reformats the extracted date into DD-MM-YYYY wherever enough information
+// exists, degrading gracefully to MM-YYYY or just YYYY when the label itself
+// doesn't specify a day (or day+month).
+const MONTH_NAME_TO_NUM = {
+    jan: 1, january: 1, feb: 2, february: 2, mar: 3, march: 3, apr: 4, april: 4,
+    may: 5, jun: 6, june: 6, jul: 7, july: 7, aug: 8, august: 8,
+    sep: 9, sept: 9, september: 9, oct: 10, october: 10, nov: 11, november: 11,
+    dec: 12, december: 12
+};
+
+function parseDateComponents(dateStr) {
+    if (!dateStr) return { day: null, month: null, year: null };
+    const s = String(dateStr).trim();
+
+    // ISO-like: YYYY-MM-DD or YYYY/MM/DD
+    let m = s.match(/^(\d{4})[-\/](\d{1,2})[-\/](\d{1,2})$/);
+    if (m) return { year: +m[1], month: +m[2], day: +m[3] };
+
+    // Numeric day-first: DD-MM-YYYY or DD/MM/YYYY (day-first is the
+    // convention used throughout this tool and in Kenyan/British usage)
+    m = s.match(/^(\d{1,2})[-\/](\d{1,2})[-\/](\d{4})$/);
+    if (m) return { day: +m[1], month: +m[2], year: +m[3] };
+
+    // "11 Jan 1981" / "23 May 1979" / "11 January 1981"
+    m = s.match(/\b(\d{1,2})\s+([A-Za-z]+)\.?\s+(\d{4})\b/);
+    if (m) {
+        const mon = MONTH_NAME_TO_NUM[m[2].toLowerCase()];
+        if (mon) return { day: +m[1], month: mon, year: +m[3] };
+    }
+
+    // "Jan 11, 1981" / "January 11 1981"
+    m = s.match(/\b([A-Za-z]+)\.?\s+(\d{1,2}),?\s+(\d{4})\b/);
+    if (m) {
+        const mon = MONTH_NAME_TO_NUM[m[1].toLowerCase()];
+        if (mon) return { day: +m[2], month: mon, year: +m[3] };
+    }
+
+    // "March 1980" — month + year only, no day recorded on the label
+    m = s.match(/\b([A-Za-z]+)\.?\s+(\d{4})\b/);
+    if (m) {
+        const mon = MONTH_NAME_TO_NUM[m[1].toLowerCase()];
+        if (mon) return { day: null, month: mon, year: +m[2] };
+    }
+
+    // Bare year only
+    m = s.match(/\b(1[89]\d{2}|20\d{2})\b/);
+    if (m) return { day: null, month: null, year: +m[1] };
+
+    return { day: null, month: null, year: null };
+}
+
+// Formats whatever date components are known as DD-MM-YYYY, degrading to
+// MM-YYYY (day unknown) or YYYY (day+month unknown) rather than fabricating
+// missing parts. Falls back to the original raw text if no year could be
+// found at all (should be rare — collectors almost always record at least a
+// year).
+function formatDateDDMMYYYY(dateStr) {
+    const { day, month, year } = parseDateComponents(dateStr);
+    if (!year) return dateStr ? String(dateStr).trim() : '';
+    const yyyy = String(year);
+    if (day && month) return `${String(day).padStart(2, '0')}-${String(month).padStart(2, '0')}-${yyyy}`;
+    if (month) return `${String(month).padStart(2, '0')}-${yyyy}`;
+    return yyyy;
+}
+
 function normalizeExtracted(extracted) {
     let candidates = [];
     if (Array.isArray(extracted.locality_candidates)) {
@@ -1644,6 +1748,19 @@ function normalizeExtracted(extracted) {
         ? extracted.habitat.trim() : null;
     extracted.habit = (typeof extracted.habit === 'string' && extracted.habit.trim().length > 0)
         ? extracted.habit.trim() : null;
+
+    // ── Collection date normalization ────────────────────────────────────────
+    // Extract day/month/year as separate values (kept as their own record
+    // fields and workbook columns — see registerSpecimen/exportBRAHMSXLSX)
+    // BEFORE reformatting collection_date, since the reformatted DD-MM-YYYY
+    // string is derived from the same parse. Note this happens early enough
+    // that MGRS.determineScheme() (which just looks for a 4-digit year
+    // substring) still works correctly on the reformatted value.
+    const dateComponents = parseDateComponents(extracted.collection_date);
+    extracted.collection_day = dateComponents.day;
+    extracted.collection_month = dateComponents.month;
+    extracted.collection_year = dateComponents.year;
+    extracted.collection_date = formatDateDDMMYYYY(extracted.collection_date);
 
     return extracted;
 }
@@ -2166,11 +2283,13 @@ function showResults(extracted, coords, calcMGRS, method, originalLocality, conv
     document.getElementById('rGeoSource').innerText = coords ? coords.source : '—';
 
     if (convertedMGRS && convertedMGRS.full) {
-        document.getElementById('rGeoSource').innerText = 'not used — MGRS present on label';
+        document.getElementById('rGeoSource').innerText = coords ? coords.source : 'not used — MGRS present on label, lat/lon derivation failed';
         document.getElementById('rowLocalityCorrected').style.display = 'none';
         document.getElementById('rLocalityUsed').innerHTML =
             '<span style="color:#8a9a8a;font-style:italic;font-family:Inter,sans-serif">geocoding skipped — MGRS present on label</span>';
-        document.getElementById('rLatLon').innerText   = 'Not calculated — geocoding skipped';
+        document.getElementById('rLatLon').innerText = coords
+            ? `${coords.lat.toFixed(6)}°, ${coords.lon.toFixed(6)}° (derived from recorded MGRS)`
+            : 'Not calculated — MGRS→lat/lon conversion failed (check network/mgrs library)';
         document.getElementById('rCalcMGRS').innerText = '—';
 
         const correctionNote = convertedMGRS.corrected
@@ -2361,7 +2480,7 @@ function showResults(extracted, coords, calcMGRS, method, originalLocality, conv
 <script>
 // ─── Batch registry (NEW): stores one record per processed specimen so the
 // table below can list every upload, "View" can restore any of them into the
-// results panel without reprocessing, and Export can build a BRAHMS CSV
+// results panel without reprocessing, and Export can build a BRAHMS workbook
 // across the whole batch. Nothing in this block touches the extraction,
 // geocoding, or MGRS logic above — it only reads the DOM/variables after
 // showResults() has already populated them for the specimen currently being
@@ -2389,6 +2508,9 @@ function registerSpecimen(thumbSrc, extracted, coords, calcMGRS, convertedMGRS, 
         collector: extracted.collector || '',
         fieldNumber: extracted.field_number || '',
         date: extracted.collection_date || '',
+        day: extracted.collection_day || '',
+        month: extracted.collection_month || '',
+        year: extracted.collection_year || '',
         habitat: extracted.habitat || '',
         habit: extracted.habit || '',
         localityRaw: (extracted.locality_candidates || []).join(' / ') || extracted.locality || '',
@@ -2451,7 +2573,13 @@ function saveCorrections() {
     record.author      = readField('rAuthor');
     record.collector   = readField('rCollector');
     record.fieldNumber = readField('rFieldNumber');
-    record.date        = readField('rDate');
+    const rawDateEdit = readField('rDate');
+    const dateComponents = parseDateComponents(rawDateEdit);
+    record.date  = formatDateDDMMYYYY(rawDateEdit);
+    record.day   = dateComponents.day || '';
+    record.month = dateComponents.month || '';
+    record.year  = dateComponents.year || '';
+    document.getElementById('rDate').innerText = record.date; // reflect the normalized format back into the panel
     record.habitat      = readField('rHabitat');
     record.habit        = readField('rHabit');
 
@@ -2653,11 +2781,21 @@ async function applySchemeOverride() {
         return;
     }
 
+    // The scheme change alters the actual grid reference, so lat/lon must
+    // be re-derived from the NEW value — the old lat/lon (if any) is now
+    // stale and would silently mismatch the corrected MGRS otherwise.
+    const derived = MGRS.toLatLon(convertedMGRS.full);
+    const geoSourceLabel = `derived from recorded MGRS (${scheme} scheme, manually applied)`;
+
     document.getElementById('finalMGRS').innerText = convertedMGRS.full;
     document.getElementById('finalNote').innerText =
         choice === 'auto'
             ? `re-evaluated automatically (${scheme}${year ? ', dated ' + year : ', date unknown'})`
             : `manually forced to ${scheme} scheme by user override`;
+    document.getElementById('rGeoSource').innerText = derived ? geoSourceLabel : 'lat/lon derivation failed';
+    document.getElementById('rLatLon').innerText = derived
+        ? `${derived.lat.toFixed(6)}°, ${derived.lon.toFixed(6)}° (derived from recorded MGRS)`
+        : 'Not calculated — MGRS→lat/lon conversion failed';
 
     const vCard = document.getElementById('validationCard');
     vCard.innerHTML = `<div class="validation-card info">
@@ -2665,6 +2803,7 @@ async function applySchemeOverride() {
         <div class="validation-body">
             Recorded MGRS <strong>${rawMgrs}</strong> was ${scheme === 'AL' ? 're-interpreted as legacy AL scheme and converted' : 'treated as current AA scheme (no row-letter shift)'}
             to produce <strong>${convertedMGRS.full}</strong>, based on a ${choice === 'auto' ? 'date re-check' : 'manual override'}.
+            ${derived ? `Coordinates re-derived: <strong>${derived.lat.toFixed(6)}°, ${derived.lon.toFixed(6)}°</strong>.` : ''}
         </div>
     </div>`;
 
@@ -2673,6 +2812,9 @@ async function applySchemeOverride() {
     // Persist to the record.
     record.finalMGRS = convertedMGRS.full;
     record.finalNote = document.getElementById('finalNote').innerText;
+    record.lat = derived ? derived.lat : null;
+    record.lon = derived ? derived.lon : null;
+    record.geoSource = derived ? geoSourceLabel : record.geoSource;
     record.snapshotHTML = document.getElementById('resultsAll').innerHTML;
     renderSpecimenTable();
 
@@ -2704,9 +2846,9 @@ function escapeHtml(s) {
 // module works by matching separate image FILES to specimen records via a
 // filename or link key, then computing its own "File Found" / "Is Linked"
 // status once a match is confirmed on import. So the fix here isn't putting
-// an image into a CSV cell (not how BRAHMS or any relational database
+// an image into a spreadsheet cell (not how BRAHMS or any relational database
 // works) — it's giving every specimen a stable, human-editable filename
-// that (a) is written into its own CSV column so BRAHMS's importer has
+// that (a) is written into its own workbook column so BRAHMS's importer has
 // something to match against, and (b) is exactly what the corresponding
 // photo is named when exported as a real file (see exportPhotosZip below).
 //
@@ -2828,7 +2970,7 @@ function renderSpecimenTable() {
     }).join('');
 }
 
-// ─── BRAHMS CSV export ─────────────────────────────────────────────────────
+// ─── BRAHMS XLSX export ─────────────────────────────────────────────────────
 // Column set follows BRAHMS's standard field structure across its Taxa,
 // Specimens, and Species Link tables:
 //   - Taxonomic/nomenclatural: Family, Genus, Species, Author, #Full Name
@@ -2852,7 +2994,7 @@ function renderSpecimenTable() {
 // filenames/link keys during a separate image-import step. This bundles
 // every specimen's photo (already held in memory as a data URL from the
 // original upload) into a single ZIP, each one named exactly as shown in
-// its "Image Filename" field/column, so the CSV and the photos line up
+// its "Image Filename" field/column, so the workbook and the photos line up
 // directly for that import.
 async function exportPhotosZip() {
     if (allSpecimens.length === 0) return;
@@ -2903,12 +3045,16 @@ async function exportPhotosZip() {
     }
 }
 
-function exportBRAHMSCSV() {
+function exportBRAHMSXLSX() {
     if (allSpecimens.length === 0) return;
+    if (typeof XLSX === 'undefined') {
+        alert('Excel library failed to load (SheetJS). Check your network connection and try again.');
+        return;
+    }
 
     const headers = [
         'Family', 'Genus', 'Species', 'Author', '#Full Name',
-        'Collector', 'Field Number', 'Date Collected',
+        'Collector', 'Field Number', 'Date Collected', 'Day', 'Month', 'Year',
         'Determined By', 'Determination Date',
         'Country', 'Gazetteer', 'Locality Notes',
         'Latitude', 'Longitude', 'Map Grid Area', 'Georef Source',
@@ -2938,11 +3084,11 @@ function exportBRAHMSCSV() {
 
         return [
             r.family, genus, speciesEpithet, r.author, fullName,
-            collectorName, fieldNumber, r.date,
+            collectorName, fieldNumber, r.date, r.day, r.month, r.year,
             '', '', // Determined By / Determination Date — not on collection labels
             'Kenya', gazetteer, localityNotes,
-            r.lat != null ? r.lat.toFixed(6) : '',
-            r.lon != null ? r.lon.toFixed(6) : '',
+            r.lat != null ? Number(r.lat.toFixed(6)) : '',
+            r.lon != null ? Number(r.lon.toFixed(6)) : '',
             r.finalMGRS, r.geoSource,
             r.habitat, r.habit,
             r.imageFilename,
@@ -2951,18 +3097,25 @@ function exportBRAHMSCSV() {
         ];
     });
 
-    const csv = [headers, ...rows].map(row =>
-        row.map(cell => `"${String(cell || '').replace(/"/g, '""')}"`).join(',')
-    ).join('\n');
+    const aoa = [headers, ...rows];
+    const ws = XLSX.utils.aoa_to_sheet(aoa);
 
-    const blob = new Blob([csv], { type: 'text/csv' });
-    const a = document.createElement('a');
-    a.href = URL.createObjectURL(blob);
-    a.download = 'herbarium_specimens_brahms.csv';
-    a.click();
+    // Reasonable column widths so the sheet is legible without the person
+    // having to manually resize every column on open.
+    ws['!cols'] = headers.map((h, colIdx) => {
+        const maxLen = Math.max(
+            h.length,
+            ...rows.map(row => String(row[colIdx] ?? '').length)
+        );
+        return { wch: Math.min(Math.max(maxLen + 2, 10), 45) };
+    });
+
+    const wb = XLSX.utils.book_new();
+    XLSX.utils.book_append_sheet(wb, ws, 'Specimens');
+    XLSX.writeFile(wb, 'herbarium_specimens_brahms.xlsx');
 }
 
-document.getElementById('exportCsvBtn').addEventListener('click', exportBRAHMSCSV);
+document.getElementById('exportXlsxBtn').addEventListener('click', exportBRAHMSXLSX);
 document.getElementById('exportZipBtn').addEventListener('click', exportPhotosZip);
 document.getElementById('clearAllBtn').addEventListener('click', () => {
     allSpecimens = [];
@@ -3091,6 +3244,25 @@ async function processFile(file, thumbSrc) {
         console.log(`MGRS present on label ("${extracted.mgrs_coordinates}") — skipping geocoding. Grid scheme: ${schemeInfo.scheme}. Result: ${convertedMGRS.full}${convertedMGRS.corrected ? ' (character correction applied: ' + convertedMGRS.correctionsApplied.join(', ') + ')' : ''}`);
         if (geocodeLog) {
             geocodeLog.finalLocalityUsed = '(skipped — MGRS present on label, scheme handled directly)';
+        }
+
+        // Geocoding is skipped here because the coordinate is already known
+        // — but the pipeline still needs decimal lat/lon (for display and
+        // for the exported workbook), so derive it from the MGRS itself
+        // rather than leaving it blank. Reuses the same `coords` shape the
+        // geocoding path produces so registerSpecimen/showResults's existing
+        // lat/lon handling picks it up without special-casing.
+        const derived = MGRS.toLatLon(convertedMGRS.full);
+        if (derived) {
+            coords = {
+                lat: derived.lat,
+                lon: derived.lon,
+                source: `derived from recorded MGRS (${schemeInfo.scheme} scheme)`,
+                display: null,
+                matchedTerm: null
+            };
+        } else {
+            console.warn(`Could not derive lat/lon from MGRS "${convertedMGRS.full}" — mgrs library may have failed to load.`);
         }
     } else {
         if (extracted.mgrs_coordinates && !(convertedMGRS && convertedMGRS.full)) {
