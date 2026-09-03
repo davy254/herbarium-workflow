@@ -521,6 +521,12 @@
         <input type="number" id="schemeCutoffYear" value="2001" min="1900" max="2099"
             style="width:64px;font-family:'IBM Plex Mono',monospace;font-size:0.8125rem;border:1px solid #c5ccc5;border-radius:4px;padding:2px 6px;background:#fff;color:#1a1f1a;">
     </span>
+    <span class="status-label" title="Prefix used when generating each specimen's unique barcode (e.g. DRSRS000123). The counter persists in this browser, so it keeps incrementing across sessions — change the prefix before starting a genuinely new batch/collection.">
+        Barcode prefix:
+        <input type="text" id="barcodePrefix" value="DRSRS" maxlength="10"
+            style="width:70px;font-family:'IBM Plex Mono',monospace;font-size:0.8125rem;border:1px solid #c5ccc5;border-radius:4px;padding:2px 6px;background:#fff;color:#1a1f1a;text-transform:uppercase;">
+        <button class="btn-test" id="resetBarcodeBtn" style="margin-left:6px;padding:0.2rem 0.6rem;" title="Reset the barcode counter to 0 for this prefix">Reset counter</button>
+    </span>
     <button class="btn-test" id="testBtn">Test connection</button>
 </div>
 
@@ -637,6 +643,10 @@
                         <div class="field-val" id="rFieldNumber" contenteditable="true" spellcheck="false">—</div>
                     </div>
                     <div class="field-row">
+                        <div class="field-key">Barcode<br><span style="font-weight:400;color:#b8c4b8;font-size:0.68rem;">(unique ID)</span></div>
+                        <div class="field-val" id="rBarcode" contenteditable="true" spellcheck="false">—</div>
+                    </div>
+                    <div class="field-row">
                         <div class="field-key">Image Filename<br><span style="font-weight:400;color:#b8c4b8;font-size:0.68rem;">(links photo↔row)</span></div>
                         <div class="field-val" id="rImageFilename" contenteditable="true" spellcheck="false">—</div>
                     </div>
@@ -716,8 +726,9 @@
         </div>
     </div>
     <div style="font-size:0.75rem;color:#8a9a8a;margin:-0.5rem 0 1rem;font-family:'Inter',sans-serif;">
-        Each photo is named to match its "Image Filename" column in the workbook, so BRAHMS's image importer can link
-        them together. Edit a specimen's Image Filename in its panel (e.g. to match a barcode once assigned) before exporting.
+        Each specimen gets a unique barcode on processing (edit the prefix above before starting a new batch), and each
+        photo is named to match its "Image Filename" column in the workbook, so BRAHMS's image importer can link them
+        together. Edit a specimen's Barcode or Image Filename in its panel if you need to correct either before exporting.
     </div>
     <div id="batchTableWrap">
         <div class="batch-empty" id="batchEmpty">No specimens processed yet — results will appear here as each upload finishes.</div>
@@ -725,6 +736,7 @@
             <thead>
                 <tr>
                     <th></th>
+                    <th>Barcode</th>
                     <th>Species</th>
                     <th>Final MGRS</th>
                     <th>Source</th>
@@ -2491,15 +2503,19 @@ let currentSpecimenId = null; // which specimen's data is currently shown in the
 
 function registerSpecimen(thumbSrc, extracted, coords, calcMGRS, convertedMGRS, method) {
     const id = 'sp_' + (++specimenCounter);
+    const barcode = generateBarcode();
 
     const ext = extensionFromDataUrl(thumbSrc);
-    const defaultBase = generateDefaultImageFilename(extracted, id);
+    const defaultBase = generateDefaultImageFilename(extracted, id, barcode);
     const imageFilename = `${defaultBase}.${ext}`;
     const fnEl = document.getElementById('rImageFilename');
     if (fnEl) fnEl.innerText = imageFilename;
+    const bcEl = document.getElementById('rBarcode');
+    if (bcEl) bcEl.innerText = barcode;
 
     const record = {
         id,
+        barcode,
         thumb: thumbSrc,
         imageFilename,
         species: extracted.species_name || '',
@@ -2582,6 +2598,10 @@ function saveCorrections() {
     document.getElementById('rDate').innerText = record.date; // reflect the normalized format back into the panel
     record.habitat      = readField('rHabitat');
     record.habit        = readField('rHabit');
+
+    const editedBarcode = readField('rBarcode');
+    record.barcode = (editedBarcode && editedBarcode !== '—') ? editedBarcode : record.barcode;
+    document.getElementById('rBarcode').innerText = record.barcode || '—';
 
     // Image filename: keep it non-empty and always carrying the correct
     // extension for the actual photo, even if the person deletes or
@@ -2867,12 +2887,68 @@ function sanitizeFilenameSegment(s) {
         .replace(/^_+|_+$/g, '');
 }
 
-function generateDefaultImageFilename(extracted, specimenId) {
-    const speciesPart = sanitizeFilenameSegment(extracted.species_name);
-    const fieldNumPart = sanitizeFilenameSegment(extracted.field_number);
-    const parts = [speciesPart, fieldNumPart].filter(Boolean);
-    const base = parts.length > 0 ? parts.join('_') : `specimen_${specimenId}`;
-    return base;
+// ── Barcode generation ───────────────────────────────────────────────────────
+// Every specimen gets a unique, sequential barcode of the form
+// "<PREFIX><6-digit counter>" (e.g. "DRSRS000123"). The prefix comes from
+// the "Barcode prefix" field in the status bar (defaults to "DRSRS"); the
+// counter is persisted in localStorage so it keeps incrementing across page
+// reloads and separate sessions, which is what "unique" actually requires —
+// an in-memory counter would hand out DRSRS000001 again after every refresh.
+// Persistence is keyed by prefix, so switching prefixes (e.g. for a
+// different collection/institution code) starts its own independent count
+// rather than colliding with another prefix's numbers.
+const BARCODE_COUNTER_KEY_PREFIX = 'herbarium_barcode_counter__';
+
+function getBarcodePrefix() {
+    const el = document.getElementById('barcodePrefix');
+    const val = el ? el.value.trim().toUpperCase().replace(/[^A-Z0-9]/g, '') : '';
+    return val || 'DRSRS';
+}
+
+function getBarcodeCounterKey(prefix) {
+    return BARCODE_COUNTER_KEY_PREFIX + prefix;
+}
+
+function peekNextBarcodeNumber(prefix) {
+    let n = parseInt(localStorage.getItem(getBarcodeCounterKey(prefix)), 10);
+    if (!Number.isFinite(n) || n < 0) n = 0;
+    return n + 1;
+}
+
+function getNextBarcodeNumber(prefix) {
+    const n = peekNextBarcodeNumber(prefix);
+    localStorage.setItem(getBarcodeCounterKey(prefix), String(n));
+    return n;
+}
+
+// Generates the next unique barcode for the CURRENT prefix and advances
+// that prefix's persisted counter. Called exactly once per specimen, at
+// registration time (see registerSpecimen) — never on every render/view, or
+// re-viewing an already-registered specimen would burn through numbers.
+function generateBarcode() {
+    const prefix = getBarcodePrefix();
+    const n = getNextBarcodeNumber(prefix);
+    return `${prefix}${String(n).padStart(6, '0')}`;
+}
+
+// ── Image filename: barcode_genus_species_ddmmyyyy_collectornumber ─────────
+// Zero-pads day/month; falls back gracefully when a date component is
+// missing so the filename is still well-formed (never fabricates a value).
+function formatDateForFilename(day, month, year) {
+    if (day && month && year) {
+        return `${String(day).padStart(2, '0')}${String(month).padStart(2, '0')}${year}`;
+    }
+    if (month && year) return `00${String(month).padStart(2, '0')}${year}`;
+    if (year) return `00000000`.slice(0, 4) + year; // no day/month known — pad with zeros, keep the year
+    return '00000000';
+}
+
+function generateDefaultImageFilename(extracted, specimenId, barcode) {
+    const speciesPart = sanitizeFilenameSegment(extracted.species_name) || 'sp';
+    const datePart = formatDateForFilename(extracted.collection_day, extracted.collection_month, extracted.collection_year);
+    const collectorNumPart = sanitizeFilenameSegment(extracted.field_number) || 'sn'; // "sn" = sine numero, no number recorded
+    const barcodePart = barcode || `SPEC${specimenId}`;
+    return `${barcodePart}_${speciesPart}_${datePart}_${collectorNumPart}`;
 }
 
 // Extracts the file extension implied by a data: URL's MIME type (the thumb
@@ -2949,6 +3025,7 @@ function renderSpecimenTable() {
                 <img class="sp-thumb" src="${r.thumb}" alt="">
                 <div style="font-size:0.62rem;color:#8a9a8a;font-family:'IBM Plex Mono',monospace;max-width:60px;overflow-wrap:break-word;margin-top:3px;">${escapeHtml(r.imageFilename)}</div>
             </td>
+            <td class="sp-mgrs">${escapeHtml(r.barcode) || '<span class="sp-empty-cell">—</span>'}</td>
             <td>
                 <span class="sp-species">${escapeHtml(r.species) || '<span class="sp-empty-cell">not found</span>'}</span>
                 ${r.author ? `<br><span style="font-size:0.72rem;color:#8a9a8a">${escapeHtml(r.author)}</span>` : ''}
@@ -2982,10 +3059,13 @@ function renderSpecimenTable() {
 //     BRAHMS links this to its own gazetteer table), Locality Notes (the
 //     fuller free-text description / other candidates), Latitude, Longitude
 //     (decimal degrees), Map Grid Area (BRAHMS's dedicated MGRS/grid field)
-//   - Physical/voucher: Barcode, Accession Number, Herbarium Code, Type
-//     Status, Duplicates — left blank, since none of these are derivable
-//     from a collection label; they're assigned at accessioning, not in the
-//     field, so filling them here would mean fabricating identifiers.
+//   - Physical/voucher: Barcode (generated by this tool at digitization
+//     time — see generateBarcode() — since BRAHMS's image importer and any
+//     downstream accessioning workflow need a stable unique ID per sheet),
+//     Accession Number, Herbarium Code, Type Status, Duplicates — these four
+//     are left blank, since none of them are derivable from a collection
+//     label; they're assigned at accessioning, not in the field, so filling
+//     them here would mean fabricating identifiers.
 // Rename any header below to match your exact BRAHMS import template if it
 // differs — row content stays the same either way.
 // ─── Photo export (ZIP) ─────────────────────────────────────────────────────
@@ -3092,7 +3172,7 @@ function exportBRAHMSXLSX() {
             r.finalMGRS, r.geoSource,
             r.habitat, r.habit,
             r.imageFilename,
-            '', '', '', '', '', // Barcode / Accession / Herbarium Code / Type Status / Duplicates — assigned at accessioning
+            r.barcode || '', '', '', '', '', // Barcode is generated by this tool; Accession / Herbarium Code / Type Status / Duplicates are still assigned at accessioning
             r.method, r.finalNote
         ];
     });
@@ -3120,6 +3200,20 @@ document.getElementById('exportZipBtn').addEventListener('click', exportPhotosZi
 document.getElementById('clearAllBtn').addEventListener('click', () => {
     allSpecimens = [];
     renderSpecimenTable();
+});
+document.getElementById('resetBarcodeBtn').addEventListener('click', () => {
+    const prefix = getBarcodePrefix();
+    const next = peekNextBarcodeNumber(prefix);
+    const ok = confirm(
+        `Reset the barcode counter for prefix "${prefix}"?\n\n` +
+        `The next specimen processed would currently get ${prefix}${String(next).padStart(6, '0')}.\n\n` +
+        `Only do this before starting a brand-new batch. Resetting mid-project can create duplicate ` +
+        `barcodes if sheets using the old sequence already exist elsewhere (BRAHMS, previous exports, ` +
+        `physical labels already printed).`
+    );
+    if (!ok) return;
+    localStorage.removeItem(getBarcodeCounterKey(prefix));
+    alert(`Counter reset. The next specimen processed will be ${prefix}000001.`);
 });
 wireSaveCorrectionsButton(); // binds the button as it exists in the initial static markup
 </script>
