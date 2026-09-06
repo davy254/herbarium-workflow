@@ -1,457 +1,129 @@
-# 🌿 Plant Specimen MGRS Validator
+# Herbarium MGRS Validator
 
-An AI-powered web application designed for herbarium curators, taxonomists, and botanists to automate the extraction, validation, and verification of geographic data from plant specimen labels.
+A single-file, browser-based tool for digitizing herbarium specimen labels. It reads a photo of a specimen sheet, extracts the taxonomic and collection data, validates or derives its MGRS grid reference, geocodes localities that don't already have coordinates, assigns a unique barcode, and exports the whole batch as a BRAHMS-ready workbook plus a matching ZIP of photos.
 
-The application uses Optical Character Recognition (OCR), Large Language Models (LLMs), geocoding services, and MGRS coordinate calculations to detect discrepancies between locality information recorded on specimen labels and the associated Military Grid Reference System (MGRS) coordinates.
+Built for digitizing Kenyan herbarium collections (originally for DRSRS), but the extraction prompts, geocoding bounds, and known-landmark anchors are the only Kenya-specific pieces — everything else generalizes to other regions with modest edits.
 
----
+## What it does
 
-## 📋 Table of Contents
+- **Vision-based extraction** — sends each label photo to a vision-capable LLM (`qwen3-vl-plus` by default) to read species name, author citation, collector, field number, date, habitat, habit, MGRS grid reference, and every place name mentioned on the label.
+- **OCR fallback** — if the vision call fails, falls back to Tesseract OCR (tuned page-segmentation mode for label layouts) plus a text-only LLM pass over the raw OCR text.
+- **MGRS cross-validation** — cross-checks the recorded grid reference against a second, narrower vision re-read and a regex scan of the OCR text, and picks the reading that parses cleanly when they disagree.
+- **Character-confusion-aware parsing** — corrects common OCR/vision misreads within the numeric easting/northing digits (e.g. `O`/`D`/`Q`→`0`, `I`/`L`→`1`, `B`→`8`) before giving up on a malformed-looking grid reference.
+- **AL → AA scheme conversion** — detects and converts legacy AL-scheme 100 km-square lettering to the current AA (WGS84/NGA) scheme, based on the specimen's collection date and a configurable cutoff year. Specimens with an unknown date are left unconverted by default rather than risking a silent, incorrect shift; a per-specimen override is available.
+- **Tiered geocoding** — when no MGRS is present on the label, geocodes the extracted locality candidates against GeoNames and Nominatim, trying exact matches on specifically-named places first, then fuzzy matches, then bare generic feature words (river, hill, valley, etc.) as a last resort. Known landmark anchors (Mount Kenya, Tsavo, Maasai Mara, major towns, etc.) are used as a distance sanity check to reject implausible matches, and county/district names on the label are used to disambiguate places with duplicate names.
+- **Inline correction** — every extracted field is click-to-edit directly in the results panel, with an explicit "Save corrections" step (nothing auto-saves per keystroke) and a "re-geocode from corrected locality" action.
+- **Unique barcode generation** — assigns each processed specimen a sequential barcode (`PREFIX000001`, `PREFIX000002`, …) and a matching photo filename in the form `barcode_genus_species_ddmmyyyy_collectornumber`, so the barcode, photo, and workbook row all line up for BRAHMS's image importer.
+- **Batch processing** — drag/drop or select multiple images; they queue and process one at a time, with every result kept in a running table.
+- **BRAHMS export** — exports the full batch as an `.xlsx` workbook matching BRAHMS's standard field set (taxonomic, collection-event, geographic, and voucher columns), and a ZIP of photos named to match.
 
-- [Overview](#overview)
-- [Features](#features)
-- [Architecture](#architecture)
-- [Tech Stack](#tech-stack)
-- [Installation](#installation)
-- [Configuration](#configuration)
-- [Usage](#usage)
-- [Workflow](#workflow)
-- [Example Output](#example-output)
-- [Project Structure](#project-structure)
-- [Dependencies](#dependencies)
-- [Troubleshooting](#troubleshooting)
-- [Future Enhancements](#future-enhancements)
-- [Contributing](#contributing)
-- [License](#license)
+## Quick start
 
----
+This is a single static HTML file with no build step. To run it:
 
-## Overview
+1. Download `herbarium_mgrs_batch.html`.
+2. Open it directly in a modern desktop browser (Chrome, Edge, or Firefox), **or** serve it locally:
+   ```bash
+   python3 -m http.server 8000
+   # then open http://localhost:8000/herbarium_mgrs_batch.html
+   ```
+3. Click **Test connection** to confirm the backend (see below) is reachable.
+4. Drop in one or more specimen photos and let them process.
 
-Herbarium specimen labels often contain valuable geographic information recorded as free-form text. Manual transcription and validation of this data can be time-consuming and prone to errors.
+> Opening the file with `file://` works for most features, but some browsers restrict certain APIs (e.g. clipboard, some fetches) under `file://`. Serving it over `http://localhost` avoids any of that friction.
 
-**Plant Specimen MGRS Validator** automates this process by:
+## Backend requirement
 
-1. Extracting text from specimen images.
-2. Parsing locality information using an LLM.
-3. Geocoding the extracted locality description.
-4. Calculating the corresponding MGRS coordinates.
-5. Comparing calculated coordinates with the MGRS recorded on the specimen label.
-6. Flagging inconsistencies for curator review.
+This tool does **not** call an LLM API directly from the browser (that would expose an API key client-side). Instead it calls a small proxy backend at:
 
-This helps improve data quality in biodiversity collections and reduces manual verification effort.
-
----
-
-## Features
-
-### 🔍 Automated OCR
-
-Extracts text directly from herbarium specimen photographs using **Tesseract.js**.
-
-### 🤖 AI-Powered Data Parsing
-
-Uses **Qwen LLM** (via MuleRouter API) to transform unstructured OCR text into structured specimen metadata:
-
-- Scientific Name
-- Locality Description
-- MGRS Coordinate
-- Collection Date
-- Collector Name
-
-### 📍 Smart Geocoding
-
-Interprets locality descriptions and converts them into precise geographic coordinates.
-
-Examples:
-
-- "2 km north of Hindi prison"
-- "Near Tana River bridge"
-- "5 miles west of Garissa town"
-
-### 🗺️ MGRS Validation
-
-Calculates the expected MGRS coordinate from geocoded latitude/longitude values and compares it with the label-recorded MGRS.
-
-Validation includes:
-
-- 100 km grid square comparison
-- Coordinate consistency checks
-- Error flagging and discrepancy reporting
-
-### 🔒 Secure Backend Proxy
-
-A Flask backend securely manages API requests, protects API keys, and avoids browser CORS limitations.
-
----
-
-## Architecture
-
-```text
-Specimen Image
-      │
-      ▼
-Tesseract.js OCR
-      │
-      ▼
-Extracted Text
-      │
-      ▼
-Qwen LLM (MuleRouter)
-      │
-      ▼
-Structured JSON
-      │
-      ▼
-Geocoding Service
-      │
-      ▼
-Latitude / Longitude
-      │
-      ▼
-MGRS Conversion
-      │
-      ▼
-Validation Engine
-      │
-      ▼
-Error Report / Verification Result
+```
+https://mgrs-validator-backend.onrender.com/api/chat
 ```
 
----
+which forwards requests to the vision/text models and returns an OpenAI-style `choices[0].message.content` response. You'll need your own equivalent backend — a minimal server that accepts `{ model, messages, temperature }` and proxies it to your LLM provider of choice. Point `BACKEND_URL` (near the top of the `<script>` block) at your own deployment.
 
-## Tech Stack
+Model IDs used by default (also configurable at the top of the script):
 
-### Frontend
+| Constant | Default | Purpose |
+|---|---|---|
+| `VISION_MODEL` | `qwen3-vl-plus` | Reads the label photo directly |
+| `TEXT_MODEL` | `qwen-plus` | OCR-fallback extraction, locality spelling suggestions |
 
-- HTML5
-- Tailwind CSS
-- Vanilla JavaScript
-- Tesseract.js
-
-### Backend
-
-- Python
-- Flask
-- Flask-CORS
-- Requests
-
-### AI & APIs
-
-- MuleRouter API
-- Qwen Large Language Model
-- OpenStreetMap Nominatim Geocoding API
-
-### Geographic Processing
-
-- MGRS Coordinate Conversion Libraries
-- Geospatial Validation Logic
-
----
-
-## Installation
-
-### Prerequisites
-
-- Python 3.9+
-- pip
-- Modern web browser
-- MuleRouter API key
-
-### Clone the Repository
-
-```bash
-git clone https://github.com/yourusername/plant-specimen-mgrs-validator.git
-
-cd plant-specimen-mgrs-validator
-```
-
-### Create Virtual Environment
-
-```bash
-python -m venv venv
-```
-
-#### Windows
-
-```bash
-venv\Scripts\activate
-```
-
-#### Linux/macOS
-
-```bash
-source venv/bin/activate
-```
-
-### Install Backend Dependencies
-
-```bash
-pip install -r requirements.txt
-```
-
-### Start Flask Server
-
-```bash
-python app.py
-```
-
-Server will run on:
-
-```text
-http://localhost:5000
-```
-
-### Launch Frontend
-
-Open:
-
-```text
-index.html
-```
-
-or serve via:
-
-```bash
-python -m http.server 8000
-```
-
-Then browse to:
-
-```text
-http://localhost:8000
-```
-
----
+Because the backend is often on a free-tier host (e.g. Render's free plan), the first request after idling can take 20–30 seconds to wake up — the connection test surfaces this rather than failing silently.
 
 ## Configuration
 
-Create a `.env` file in the project root:
+All of the following are editable directly in the running app (no code changes needed for day-to-day use):
 
-```env
-MULEROUTER_API_KEY=your_api_key_here
-```
+| Setting | Where | Purpose |
+|---|---|---|
+| **AL → AA cutoff year** | Status bar | Specimens dated before this year are treated as legacy AL-scheme MGRS and converted; on/after, left as current AA scheme. Default `2001` — adjust to match when your region's surveys switched schemes. |
+| **Barcode prefix** | Status bar | Prefix for generated barcodes (e.g. `DRSRS` → `DRSRS000001`). The counter is stored per-prefix in the browser's `localStorage`, so it persists across sessions and reloads. |
+| **Reset counter** | Status bar | Resets the barcode counter for the *current* prefix back to zero. Only use this before starting a genuinely new batch — resetting mid-project risks duplicate barcodes if earlier numbers are already in use elsewhere (BRAHMS, prior exports, printed labels). |
+| **Grid Scheme override** | Per-specimen, results panel | Forces a specimen's recorded MGRS to be interpreted as AL or AA, overriding the date-based default — useful when a label has no parseable date or the date parsing misfires. |
 
-Example Flask configuration:
+Code-level configuration (top of the `<script>` block, or the `GEONAMES_USER` constant):
 
-```python
-import os
+- `BACKEND_URL`, `VISION_MODEL`, `TEXT_MODEL` — see above.
+- `GEONAMES_USER` — your [GeoNames](https://www.geonames.org/login) account username (free registration; needed for the GeoNames geocoding tier). Nominatim (OpenStreetMap) is used as a fallback and needs no key.
+- `KENYA_BOUNDS`, `KENYA_COUNTIES`, `KNOWN_ANCHORS` — adjust or replace these if you're digitizing a different country's collections. `KNOWN_ANCHORS` in particular is what gives the geocoder a sanity-check radius around well-known landmarks; add your own region's equivalents.
 
-API_KEY = os.getenv("MULEROUTER_API_KEY")
-```
+## Barcode & filename convention
 
-**Important:** Never expose API keys in frontend JavaScript.
+Each processed specimen is assigned:
 
----
+- **Barcode:** `PREFIX` + 6-digit zero-padded sequence, e.g. `DRSRS000001`. Editable per-specimen if you need to correct or reassign it.
+- **Image filename:** `barcode_genus_species_ddmmyyyy_collectornumber.<ext>`, e.g. `DRSRS000001_Uvaria_lucida_11011981_13880.jpg`.
+  - `genus_species` comes from the extracted species name (author citation excluded).
+  - `ddmmyyyy` is zero-padded from the extracted collection date; unknown day/month/year fall back to `00` and `0000` respectively rather than being guessed.
+  - `collectornumber` is the extracted field/collector number, or `sn` (*sine numero* — "without number") if none was found on the label.
 
-## Usage
+This filename is written into the exported workbook's **Image Filename** column and is exactly how the photo is named in the downloaded ZIP, so BRAHMS's image importer can match photo files to specimen records directly on import.
 
-### Step 1: Upload Specimen Image
+## BRAHMS export column mapping
 
-Upload a herbarium specimen photograph containing label information.
+The exported `.xlsx` follows BRAHMS's standard field structure:
 
-### Step 2: OCR Processing
+- **Taxonomic:** Family *(blank — not extracted from labels)*, Genus, Species, Author, #Full Name
+- **Collection event:** Collector, Field Number, Date Collected, Day, Month, Year, Determined By / Determination Date *(blank — filled in during identification, not present on collection labels)*
+- **Geographic:** Country, Gazetteer (matched/most specific place name), Locality Notes (other candidates), Latitude, Longitude, Map Grid Area (final MGRS), Georef Source
+- **Descriptive:** Habitat, Habit
+- **Linking:** Image Filename
+- **Voucher:** Barcode (generated by this tool), Accession Number / Herbarium Code / Type Status / Duplicates *(blank — assigned at accessioning)*
+- **Provenance:** Extraction Method, Notes
 
-The application extracts text from the image using Tesseract.js.
+Rename headers in `exportBRAHMSXLSX()` if your BRAHMS import template differs — row content is unaffected either way.
 
-### Step 3: Metadata Extraction
+## Tech stack
 
-Qwen parses the OCR output into structured specimen data.
+Pure client-side HTML/CSS/JS — no framework, no build step, no server component beyond the LLM proxy.
 
-### Step 4: Geocoding
+- [Tailwind CSS](https://tailwindcss.com/) (CDN) — base styling utility classes
+- [Tesseract.js](https://github.com/naptha/tesseract.js) — in-browser OCR fallback
+- [JSZip](https://stuk.github.io/jszip/) — bundling exported photos into a ZIP
+- [SheetJS (xlsx)](https://github.com/SheetJS/sheetjs) — building the `.xlsx` workbook
+- [mgrs](https://github.com/proj4js/mgrs) — MGRS ↔ lat/lon conversion
+- [GeoNames](https://www.geonames.org/) and [Nominatim](https://nominatim.org/) — geocoding
+- A small self-hosted backend proxying to an LLM provider (vision + text)
 
-The locality description is converted into geographic coordinates.
+## Known limitations
 
-### Step 5: MGRS Validation
+- Geocoding and the known-landmark anchors are scoped to Kenya (`KENYA_BOUNDS`, `KENYA_COUNTIES`, `KNOWN_ANCHORS`) — using this for another country's collections requires updating those constants.
+- Handwritten labels remain the hardest case for both the vision model and Tesseract; always spot-check extracted fields, especially the MGRS reading, against the source image.
+- Family is not extracted (not reliably present on most labels) and is left blank in the export for manual entry.
+- The barcode counter lives in browser `localStorage`, scoped to one browser/profile — it is **not** synchronized across machines or shared with collaborators. If more than one person is digitizing into the same barcode sequence, coordinate prefixes/ranges out of band (e.g. assign each digitizer a distinct prefix, or agree on non-overlapping counter ranges) to avoid collisions.
+- No authentication or access control — this is a single-user local tool, not a multi-user web service.
 
-The system calculates the expected MGRS coordinate and compares it with the recorded value.
+## Roadmap ideas
 
-### Step 6: Review Results
-
-The application displays:
-
-- Extracted metadata
-- Geocoded coordinates
-- Calculated MGRS
-- Recorded MGRS
-- Validation status
-- Error flags
-
----
-
-## Workflow
-
-### Input Label Text
-
-```text
-Acacia tortilis
-
-Kenya, Lamu County
-2 km north of Hindi Prison
-
-MGRS: 37MBV1234567890
-
-Collector: J. Smith
-Date: 12 May 1985
-```
-
-### Parsed Output
-
-```json
-{
-  "species": "Acacia tortilis",
-  "locality": "2 km north of Hindi Prison, Lamu County, Kenya",
-  "mgrs_recorded": "37MBV1234567890",
-  "collector": "J. Smith",
-  "date": "1985-05-12"
-}
-```
-
-### Validation Result
-
-```json
-{
-  "latitude": -2.12345,
-  "longitude": 40.56789,
-  "mgrs_calculated": "37MBU1235567891",
-  "mgrs_recorded": "37MBV1234567890",
-  "status": "MISMATCH",
-  "warning": "100km grid square identifier differs"
-}
-```
-
----
-
-## Example Output
-
-| Field | Value |
-|---------|---------|
-| Species | Acacia tortilis |
-| Locality | 2 km north of Hindi Prison |
-| Latitude | -2.12345 |
-| Longitude | 40.56789 |
-| Recorded MGRS | 37MBV1234567890 |
-| Calculated MGRS | 37MBU1235567891 |
-| Status | ❌ Mismatch |
-
----
-
-
-
----
-
-## Dependencies
-
-### Backend
-
-```text
-Flask
-Flask-CORS
-Requests
-python-dotenv
-mgrs
-```
-
-### Frontend
-
-```text
-Tesseract.js
-Tailwind CSS
-```
-
----
-
-## Troubleshooting
-
-### OCR Produces Poor Results
-
-- Use high-resolution specimen photographs.
-- Ensure labels are clearly visible.
-- Improve image contrast before upload.
-
-### Geocoding Fails
-
-- Verify locality descriptions contain sufficient geographic detail.
-- Check internet connectivity.
-- Confirm Nominatim service availability.
-
-### Invalid MGRS Conversion
-
-- Verify recorded MGRS format.
-- Ensure coordinate conversion library is installed correctly.
-- Confirm geocoding returned valid coordinates.
-
-### API Errors
-
-- Verify MuleRouter API key.
-- Check Flask backend logs.
-- Ensure proxy server is running.
-
----
-
-## Future Enhancements
-
-- Batch specimen processing
-- Interactive map visualization
-- Confidence scoring for geocoding results
-- Multiple geocoding provider support
-- Darwin Core export support
-- Herbarium database integration
-- CSV and Excel report generation
-- User authentication and audit logging
-
----
-
-## Contributing
-
-Contributions are welcome.
-
-To contribute:
-
-1. Fork the repository
-2. Create a feature branch
-
-```bash
-git checkout -b feature/new-feature
-```
-
-3. Commit changes
-
-```bash
-git commit -m "Add new feature"
-```
-
-4. Push branch
-
-```bash
-git push origin feature/new-feature
-```
-
-5. Open a Pull Request
-
----
+- Export barcodes as printable labels (e.g. Code128/QR) alongside the workbook.
+- Optional server-side persistence so a batch can be resumed across devices.
+- Region-agnostic geocoding config (swap country bounds/anchors via a settings panel instead of code edits).
 
 ## License
 
-This project is licensed under the MIT License.
+Add your preferred license here (e.g. MIT) before publishing.
 
-```text
-MIT License
+## Acknowledgments
 
-Copyright (c) [YEAR]
-
-Permission is hereby granted, free of charge,
-to any person obtaining a copy of this software...
-```
-
-See the LICENSE file for full details.
-
----
-
-### Acknowledgements
-
-- OpenStreetMap Nominatim
-- Tesseract.js OCR Project
-- Qwen Large Language Models
-- Flask Community
-- Herbarium and biodiversity informatics practitioners who inspired this workflow
+Built for herbarium specimen digitization workflows at the Directorate of Resource Surveys and Remote Sensing (DRSRS), Kenya.
