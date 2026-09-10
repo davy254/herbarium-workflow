@@ -22,7 +22,7 @@ Built for digitizing Kenyan herbarium collections (originally for DRSRS), but th
 
 This is a single static HTML file with no build step. To run it:
 
-1. Download `herbarium_mgrs_batch.html`.
+1. Download `index.html`.
 2. Open it directly in a modern desktop browser (Chrome, Edge, or Firefox), **or** serve it locally:
    ```bash
    python3 -m http.server 8000
