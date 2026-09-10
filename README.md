@@ -26,7 +26,7 @@ This is a single static HTML file with no build step. To run it:
 2. Open it directly in a modern desktop browser (Chrome, Edge, or Firefox), **or** serve it locally:
    ```bash
    python3 -m http.server 8000
-   # then open http://localhost:8000/herbarium_mgrs_batch.html
+   # then open http://localhost:8000/index.html
    ```
 3. Click **Test connection** to confirm the backend (see below) is reachable.
 4. Drop in one or more specimen photos and let them process.
