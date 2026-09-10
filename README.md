@@ -117,9 +117,7 @@ Pure client-side HTML/CSS/JS — no framework, no build step, no server componen
 - Optional server-side persistence so a batch can be resumed across devices.
 - Region-agnostic geocoding config (swap country bounds/anchors via a settings panel instead of code edits).
 
-## License
 
-Add your preferred license here (e.g. MIT) before publishing.
 
 ## Acknowledgments
 
